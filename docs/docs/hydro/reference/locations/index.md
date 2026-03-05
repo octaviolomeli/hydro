@@ -3,7 +3,7 @@ Hydro is a **global**, **distributed** programming model. This means that the da
 
 Each [live collection](pathname:///rustdoc/hydro_lang/live_collections/) has a type parameter `L` which will always be a type that implements the `Location` trait (e.g. [`Process`](./processes.md) and [`Cluster`](./clusters.md), documented in this section). Computation has to happen at a single place, so Hydro APIs that consume multiple live collections will require all inputs to have the same location type. Moreover, most Hydro APIs that transform live collections will emit a new live collection output with the same location type as the input.
 
-To create distributed programs, Hydro provides a variety of APIs to _move_ live collections between locations via network send/receive. For example, `Stream`s can be sent from one process to another process using `.send_bincode(&loc2)` (which uses [bincode](https://docs.rs/bincode/latest/bincode/) as a serialization format). The sections for each location type ([`Process`](./processes.md), [`Cluster`](./clusters.md)) discuss the networking APIs in further detail.
+To create distributed programs, Hydro provides a variety of APIs to _move_ live collections between locations via network send/receive. For example, `Stream`s can be sent from one process to another process using `.send(&loc2, ...)`. The sections for each location type ([`Process`](./processes.md), [`Cluster`](./clusters.md)) discuss the networking APIs in further detail.
 
 ## Creating Locations
 Locations can be created by calling the appropriate method on the global `FlowBuilder` (e.g. `flow.process()` or `flow.cluster()`). These methods will return a handle to the location that can be used to create live collections and run computations.
@@ -16,7 +16,7 @@ It is possible to create **different** locations that still have the same type, 
 
 ```rust
 # use hydro_lang::prelude::*;
-let flow = FlowBuilder::new();
+let mut flow = FlowBuilder::new();
 let process1: Process<()> = flow.process::<()>();
 let process2: Process<()> = flow.process::<()>();
 
@@ -28,7 +28,7 @@ These locations will not be unified and may be deployed to separate machines. Wh
 
 ```rust
 # use hydro_lang::prelude::*;
-let flow = FlowBuilder::new();
+let mut flow = FlowBuilder::new();
 let process1: Process<()> = flow.process::<()>();
 let process2: Process<()> = flow.process::<()>();
 

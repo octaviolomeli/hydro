@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ pub mod ports;
 pub mod service;
 pub use service::*;
 
+#[cfg(feature = "profile-folding")]
 pub(crate) mod flamegraph;
 pub mod tracing_options;
 
@@ -33,37 +35,45 @@ pub enum CrateTarget {
 #[derive(Clone)]
 pub struct RustCrate {
     src: PathBuf,
+    workspace_root: PathBuf,
     target: CrateTarget,
     profile: Option<String>,
     rustflags: Option<String>,
     target_dir: Option<PathBuf>,
     build_env: Vec<(String, String)>,
+    is_dylib: bool,
     no_default_features: bool,
     features: Option<Vec<String>>,
     config: Vec<String>,
     tracing: Option<TracingOptions>,
     args: Vec<String>,
     display_name: Option<String>,
+    env: HashMap<String, String>,
 }
 
 impl RustCrate {
     /// Creates a new `RustCrate`.
     ///
     /// The `src` argument is the path to the package's directory.
-    pub fn new(src: impl Into<PathBuf>) -> Self {
+    /// The `crate_root` argument is a path to the package's workspace root, which may
+    /// be a parent of `src` in a multi-crate workspace.
+    pub fn new(src: impl Into<PathBuf>, workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             src: src.into(),
+            workspace_root: workspace_root.into(),
             target: CrateTarget::Default,
             profile: None,
             rustflags: None,
             target_dir: None,
             build_env: vec![],
+            is_dylib: false,
             no_default_features: false,
             features: None,
             config: vec![],
             tracing: None,
             args: vec![],
             display_name: None,
+            env: HashMap::new(),
         }
     }
 
@@ -123,6 +133,11 @@ impl RustCrate {
         self
     }
 
+    pub fn set_is_dylib(mut self, is_dylib: bool) -> Self {
+        self.is_dylib = is_dylib;
+        self
+    }
+
     pub fn no_default_features(mut self) -> Self {
         self.no_default_features = true;
         self
@@ -171,6 +186,12 @@ impl RustCrate {
         self
     }
 
+    /// Sets an environment variable to be written to a .env file on the launched instance.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
     pub fn get_build_params(&self, target: HostTargetType) -> BuildParams {
         let (bin, example) = match &self.target {
             CrateTarget::Default => (None, None),
@@ -180,6 +201,7 @@ impl RustCrate {
 
         BuildParams::new(
             self.src.clone(),
+            self.workspace_root.clone(),
             bin,
             example,
             self.profile.clone(),
@@ -188,6 +210,7 @@ impl RustCrate {
             self.build_env.clone(),
             self.no_default_features,
             target,
+            self.is_dylib,
             self.features.clone(),
             self.config.clone(),
         )
@@ -207,34 +230,7 @@ impl ServiceBuilder for RustCrate {
             Some(self.args),
             self.display_name,
             vec![],
+            self.env,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::deployment;
-
-    #[tokio::test]
-    async fn test_crate_panic() {
-        let mut deployment = deployment::Deployment::new();
-
-        let service = deployment.add_service(
-            RustCrate::new("../hydro_deploy_examples")
-                .example("panic_program")
-                .profile("dev"),
-            deployment.Localhost(),
-        );
-
-        deployment.deploy().await.unwrap();
-
-        let mut stdout = service.stdout();
-
-        deployment.start().await.unwrap();
-
-        assert_eq!(stdout.recv().await.unwrap(), "hello!");
-
-        assert!(stdout.recv().await.is_none());
     }
 }

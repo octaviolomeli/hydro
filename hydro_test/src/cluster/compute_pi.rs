@@ -1,12 +1,13 @@
 use std::time::Duration;
 
+use hydro_lang::live_collections::stream::ExactlyOnce;
 use hydro_lang::prelude::*;
 
-pub struct Worker {}
-pub struct Leader {}
+pub enum Worker {}
+pub enum Leader {}
 
 pub fn compute_pi<'a>(
-    flow: &FlowBuilder<'a>,
+    flow: &mut FlowBuilder<'a>,
     batch_size: usize,
 ) -> (Cluster<'a, Worker>, Process<'a, Leader>) {
     let cluster = flow.cluster();
@@ -30,19 +31,22 @@ pub fn compute_pi<'a>(
         .all_ticks();
 
     let estimate = trials
-        .send_bincode(&process)
+        .send(&process, TCP.fail_stop().bincode())
         .values()
-        .reduce_commutative(q!(|(inside, total), (inside_batch, total_batch)| {
-            *inside += inside_batch;
-            *total += total_batch;
-        }));
+        .reduce(q!(
+            |(inside, total), (inside_batch, total_batch)| {
+                *inside += inside_batch;
+                *total += total_batch;
+            },
+            commutative = manual_proof!(/** int addition is commutative */)
+        ));
 
     estimate
         .sample_every(
             q!(Duration::from_secs(1)),
             nondet!(/** intentional output */),
         )
-        .assume_retries(nondet!(/** extra logs due to duplicate samples are okay */))
+        .assume_retries::<ExactlyOnce>(nondet!(/** extra logs due to duplicate samples are okay */))
         .for_each(q!(|(inside, total)| {
             println!(
                 "pi: {} ({} trials)",
@@ -60,15 +64,15 @@ mod tests {
 
     #[test]
     fn compute_pi_ir() {
-        let builder = hydro_lang::compile::builder::FlowBuilder::new();
-        let _ = super::compute_pi(&builder, 8192);
-        let built = builder.with_default_optimize::<HydroDeploy>();
+        let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
+        let _ = super::compute_pi(&mut builder, 8192);
+        let mut built = builder.with_default_optimize::<HydroDeploy>();
 
         hydro_build_utils::assert_debug_snapshot!(built.ir());
 
-        for (id, ir) in built.preview_compile().all_dfir() {
+        for (location_key, ir) in built.preview_compile().all_dfir() {
             hydro_build_utils::insta::with_settings!({
-                snapshot_suffix => format!("surface_graph_{id}"),
+                snapshot_suffix => format!("surface_graph_{location_key}"),
             }, {
                 hydro_build_utils::assert_snapshot!(ir.surface_syntax_string());
             });

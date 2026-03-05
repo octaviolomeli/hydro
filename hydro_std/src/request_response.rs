@@ -51,7 +51,7 @@ mod tests {
     /// Test that join_responses correctly joins metadata with responses.
     #[test]
     fn test_join_responses_basic() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process::<()>();
 
         // Set up inputs (TotalOrder for deterministic simulation)
@@ -64,10 +64,10 @@ mod tests {
         let metadata_ack = metadata_processing.clone().end_atomic();
         let metadata = metadata_processing
             .batch_atomic(nondet!(/** test */))
-            .weakest_ordering();
+            .weaken_ordering();
 
         // Join responses with metadata (weaken ordering for join_responses)
-        let joined = join_responses(responses.weakest_ordering(), metadata);
+        let joined = join_responses(responses.weaken_ordering(), metadata);
 
         // Set up outputs
         let metadata_ack_recv = metadata_ack.sim_output();
@@ -80,10 +80,10 @@ mod tests {
             metadata_ack_recv.assert_yields([(1, 42)]).await;
 
             // Now send response
-            response_send.send((1, "hello".to_string()));
+            response_send.send((1, "hello".to_owned()));
             // Should get joined result
             joined_recv
-                .assert_yields_unordered([(1, (42, "hello".to_string()))])
+                .assert_yields_unordered([(1, (42, "hello".to_owned()))])
                 .await;
         });
     }
@@ -91,7 +91,7 @@ mod tests {
     /// Test that metadata persists across ticks until matched with a response.
     #[test]
     fn test_join_responses_metadata_persists() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process::<()>();
 
         let (response_send, responses) = process.sim_input::<(u32, String), _, _>();
@@ -102,9 +102,9 @@ mod tests {
         let metadata_ack = metadata_processing.clone().end_atomic();
         let metadata = metadata_processing
             .batch_atomic(nondet!(/** test */))
-            .weakest_ordering();
+            .weaken_ordering();
 
-        let joined = join_responses(responses.weakest_ordering(), metadata);
+        let joined = join_responses(responses.weaken_ordering(), metadata);
 
         let metadata_ack_recv = metadata_ack.sim_output();
         let joined_recv = joined.sim_output();
@@ -115,11 +115,11 @@ mod tests {
             metadata_ack_recv.assert_yields([(1, 10), (2, 20)]).await;
 
             // Send responses for both keys
-            response_send.send_many([(2, "two".to_string()), (1, "one".to_string())]);
+            response_send.send_many([(2, "two".to_owned()), (1, "one".to_owned())]);
             joined_recv
                 .assert_yields_only_unordered([
-                    (1, (10, "one".to_string())),
-                    (2, (20, "two".to_string())),
+                    (1, (10, "one".to_owned())),
+                    (2, (20, "two".to_owned())),
                 ])
                 .await;
         });
@@ -128,7 +128,7 @@ mod tests {
     /// Test that responses without metadata are not emitted.
     #[test]
     fn test_join_responses_no_metadata() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process::<()>();
 
         let (response_send, responses) = process.sim_input::<(u32, String), _, _>();
@@ -139,9 +139,9 @@ mod tests {
         let metadata_ack = metadata_processing.clone().end_atomic();
         let metadata = metadata_processing
             .batch_atomic(nondet!(/** test */))
-            .weakest_ordering();
+            .weaken_ordering();
 
-        let joined = join_responses(responses.weakest_ordering(), metadata);
+        let joined = join_responses(responses.weaken_ordering(), metadata);
 
         let metadata_ack_recv = metadata_ack.sim_output();
         let joined_recv = joined.sim_output();
@@ -152,11 +152,11 @@ mod tests {
             metadata_ack_recv.assert_yields([(1, 42)]).await;
 
             // Send responses for key 1 (has metadata) and key 2 (no metadata)
-            response_send.send_many([(1, "matched".to_string()), (2, "unmatched".to_string())]);
+            response_send.send_many([(1, "matched".to_owned()), (2, "unmatched".to_owned())]);
 
             // Only key 1 should produce output
             joined_recv
-                .assert_yields_only_unordered([(1, (42, "matched".to_string()))])
+                .assert_yields_only_unordered([(1, (42, "matched".to_owned()))])
                 .await;
         });
     }
@@ -164,7 +164,7 @@ mod tests {
     /// Test that metadata is removed after being matched with a response.
     #[test]
     fn test_join_responses_metadata_removed_after_match() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process::<()>();
 
         let (response_send, responses) = process.sim_input::<(u32, String), _, _>();
@@ -175,9 +175,9 @@ mod tests {
         let metadata_ack = metadata_processing.clone().end_atomic();
         let metadata = metadata_processing
             .batch_atomic(nondet!(/** test */))
-            .weakest_ordering();
+            .weaken_ordering();
 
-        let joined = join_responses(responses.weakest_ordering(), metadata);
+        let joined = join_responses(responses.weaken_ordering(), metadata);
 
         let metadata_ack_recv = metadata_ack.sim_output();
         let joined_recv = joined.sim_output();
@@ -188,13 +188,13 @@ mod tests {
             metadata_ack_recv.assert_yields([(1, 42)]).await;
 
             // First response for key 1 should match
-            response_send.send((1, "first".to_string()));
+            response_send.send((1, "first".to_owned()));
             joined_recv
-                .assert_yields_unordered([(1, (42, "first".to_string()))])
+                .assert_yields_unordered([(1, (42, "first".to_owned()))])
                 .await;
 
             // Second response for key 1 should be dropped (metadata already consumed)
-            response_send.send((1, "second".to_string()));
+            response_send.send((1, "second".to_owned()));
             joined_recv.assert_no_more().await;
         });
     }

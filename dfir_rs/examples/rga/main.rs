@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use adjacency::rga_adjacency;
 use clap::{Parser, ValueEnum};
@@ -68,18 +68,18 @@ pub async fn main() {
         serde_graph.open_graph(graph, opts.write_config).unwrap();
     }
 
-    keystroke((1, 0, 'a'), (0, 0), &input_send).await;
-    keystroke((2, 0, 'b'), (1, 0), &input_send).await;
-    keystroke((3, 0, 'a'), (2, 0), &input_send).await;
-    keystroke((4, 0, 't'), (3, 0), &input_send).await;
-    keystroke((5, 0, 'e'), (4, 0), &input_send).await;
+    keystroke((1, 0, 'a'), (0, 0), &input_send);
+    keystroke((2, 0, 'b'), (1, 0), &input_send);
+    keystroke((3, 0, 'a'), (2, 0), &input_send);
+    keystroke((4, 0, 't'), (3, 0), &input_send);
+    keystroke((5, 0, 'e'), (4, 0), &input_send);
 
-    keystroke((6, 1, 'o'), (2, 0), &input_send).await;
-    keystroke((7, 1, 'r'), (6, 1), &input_send).await;
-    keystroke((8, 0, 'C'), (0, 0), &input_send).await;
-    keystroke((9, 0, 'o'), (8, 0), &input_send).await;
-    keystroke((10, 0, 'l'), (9, 0), &input_send).await;
-    keystroke((11, 0, 'l'), (10, 0), &input_send).await;
+    keystroke((6, 1, 'o'), (2, 0), &input_send);
+    keystroke((7, 1, 'r'), (6, 1), &input_send);
+    keystroke((8, 0, 'C'), (0, 0), &input_send);
+    keystroke((9, 0, 'o'), (8, 0), &input_send);
+    keystroke((10, 0, 'l'), (9, 0), &input_send);
+    keystroke((11, 0, 'l'), (10, 0), &input_send);
 
     hf.run_tick_sync();
 
@@ -88,7 +88,7 @@ pub async fn main() {
     println!("{}", output);
 }
 
-async fn keystroke(
+fn keystroke(
     (node_ts, node_id, c): (usize, usize, char),
     (parent_ts, parent_id): (usize, usize),
     input_send: &UnboundedSender<(Token, Timestamp)>,
@@ -112,8 +112,8 @@ async fn write_to_dot(
     list_recv: &mut UnboundedReceiverStream<(Timestamp, Timestamp)>,
     w: &mut impl std::fmt::Write,
 ) {
-    let tree_edges: HashSet<_> = collect_ready_async(rga_recv).await;
-    let list_edges: HashMap<_, _> = collect_ready_async(list_recv).await;
+    let tree_edges: BTreeSet<_> = collect_ready_async(rga_recv).await;
+    let list_edges: BTreeMap<_, _> = collect_ready_async(list_recv).await;
     let node_names = tree_edges
         .iter()
         .map(|(c, _)| (c.ts, c.value))
@@ -149,7 +149,7 @@ async fn write_to_dot(
         x = *y;
     }
     if result.is_empty() {
-        result = "Unknown".to_string()
+        result = "Unknown".to_owned()
     };
     writeln!(w, "label=<<FONT COLOR=\"blue\">{}</FONT>>", result).unwrap();
     writeln!(w, "}}").unwrap();

@@ -1,18 +1,29 @@
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use hydro_deploy::gcp::GcpNetwork;
-use hydro_deploy::{Deployment, Host};
+use hydro_deploy::{AwsNetwork, Deployment, Host};
 use hydro_lang::deploy::TrybuildHost;
+use hydro_lang::location::Location;
 use hydro_lang::viz::config::GraphConfig;
+use stageleft::q;
 
 type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
 
 #[derive(Parser, Debug)]
+#[command(group(
+    clap::ArgGroup::new("cloud")
+        .args(&["gcp", "aws"])
+        .multiple(false)
+))]
 struct Args {
     /// Use GCP instead of localhost (requires project name)
     #[clap(long)]
     gcp: Option<String>,
+
+    /// Use AWS, make sure credentials are set up
+    #[arg(long, action = ArgAction::SetTrue)]
+    aws: bool,
 
     #[clap(flatten)]
     graph: GraphConfig,
@@ -23,8 +34,9 @@ async fn main() {
     let args = Args::parse();
     let mut deployment = Deployment::new();
 
-    let create_host: HostCreator = if let Some(project) = args.gcp {
-        let network = GcpNetwork::new(&project, None);
+    let create_host: HostCreator = if let Some(project) = &args.gcp {
+        let network = GcpNetwork::new(project, None);
+        let project = project.clone();
 
         Box::new(move |deployment| -> Arc<dyn Host> {
             deployment
@@ -36,15 +48,29 @@ async fn main() {
                 .network(network.clone())
                 .add()
         })
+    } else if args.aws {
+        let region = "us-east-1";
+        let network = AwsNetwork::new(region, None);
+
+        Box::new(move |deployment| -> Arc<dyn Host> {
+            deployment
+                .AwsEc2Host()
+                .region(region)
+                .instance_type("t3.micro")
+                .ami("ami-0e95a5e2743ec9ec9") // Amazon Linux 2
+                .network(network.clone())
+                .add()
+        })
     } else {
         let localhost = deployment.Localhost();
         Box::new(move |_| -> Arc<dyn Host> { localhost.clone() })
     };
 
-    let builder = hydro_lang::compile::builder::FlowBuilder::new();
+    let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let num_participants = 3;
     let num_clients = 3;
     let num_clients_per_node = 100; // Change based on experiment between 1, 50, 100.
+    let print_result_frequency = 1000; // Millis
 
     let coordinator = builder.process();
     let participants = builder.cluster();
@@ -52,12 +78,18 @@ async fn main() {
     let client_aggregator = builder.process();
 
     hydro_test::cluster::two_pc_bench::two_pc_bench(
-        num_clients_per_node,
         &coordinator,
         &participants,
         num_participants,
         &clients,
+        clients.singleton(q!(std::env::var("NUM_CLIENTS_PER_NODE")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap())),
         &client_aggregator,
+        print_result_frequency / 10,
+        print_result_frequency,
+        hydro_std::bench_client::pretty_print_bench_results,
     );
 
     // Extract the IR for graph visualization
@@ -76,7 +108,11 @@ async fn main() {
     // Optimize the flow before deployment to remove marker nodes
     let optimized = built.with_default_optimize();
 
-    let rustflags = "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off";
+    let rustflags = if args.gcp.is_some() || args.aws {
+        "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-args=--no-rosegment"
+    } else {
+        "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+    };
 
     let _nodes = optimized
         .with_process(
@@ -90,8 +126,11 @@ async fn main() {
         )
         .with_cluster(
             &clients,
-            (0..num_clients)
-                .map(|_| TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags)),
+            (0..num_clients).map(|_| {
+                TrybuildHost::new(create_host(&mut deployment))
+                    .rustflags(rustflags)
+                    .env("NUM_CLIENTS_PER_NODE", num_clients_per_node.to_string())
+            }),
         )
         .with_process(
             &client_aggregator,

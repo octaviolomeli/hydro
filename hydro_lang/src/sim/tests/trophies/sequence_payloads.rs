@@ -73,8 +73,7 @@ fn sequence_payloads_old<'a, L: Location<'a> + NoTick>(
         ))
         .map(q!(|(sorted_payload, _)| { sorted_payload }));
     let r_new_non_processable_payloads = r_sorted_payloads
-        .clone()
-        .cross_singleton(r_highest_seq_processable_payload.clone())
+        .cross_singleton(r_highest_seq_processable_payload)
         .filter(q!(
             |(sorted_payload, highest_seq)| sorted_payload.seq > *highest_seq
         ))
@@ -88,7 +87,7 @@ fn sequence_payloads_old<'a, L: Location<'a> + NoTick>(
 #[should_panic]
 fn test() {
     // run as PATH="$PATH:." cargo sim -p hydro_lang --features sim -- trophies::sequence_payloads
-    let flow = FlowBuilder::new();
+    let mut flow = FlowBuilder::new();
     let node = flow.process::<()>();
     let tick = node.tick();
 
@@ -134,7 +133,7 @@ fn test() {
 #[test]
 #[cfg_attr(target_os = "windows", ignore)] // trace locations don't work on Windows right now
 fn trace_snapshot() {
-    let flow = FlowBuilder::new();
+    let mut flow = FlowBuilder::new();
     let node = flow.process::<()>();
     let tick = node.tick();
 

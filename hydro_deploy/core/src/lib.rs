@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -75,6 +75,7 @@ pub struct ResourceResult {
     _last_result: Option<Arc<ResourceResult>>,
 }
 
+#[cfg(feature = "profile-folding")]
 #[derive(Clone, Debug)]
 pub struct TracingResults {
     pub folded_data: Vec<u8>,
@@ -95,6 +96,7 @@ pub trait LaunchedBinary: Send + Sync {
     fn stdout_filter(&self, prefix: String) -> mpsc::UnboundedReceiver<String>;
     fn stderr_filter(&self, prefix: String) -> mpsc::UnboundedReceiver<String>;
 
+    #[cfg(feature = "profile-folding")]
     fn tracing_results(&self) -> Option<&TracingResults>;
 
     fn exit_code(&self) -> Option<i32>;
@@ -121,7 +123,7 @@ pub trait LaunchedHost: Send + Sync {
                 demux
                     .iter()
                     .map(|(key, underlying)| (*key, self.server_config(underlying)))
-                    .collect::<HashMap<_, _>>(),
+                    .collect(),
             ),
             ServerStrategy::Merge(merge) => ServerBindConfig::Merge(
                 merge
@@ -144,6 +146,7 @@ pub trait LaunchedHost: Send + Sync {
         binary: &BuildOutput,
         args: &[String],
         perf: Option<TracingOptions>,
+        env: &HashMap<String, String>,
     ) -> Result<Box<dyn LaunchedBinary>>;
 
     async fn forward_port(&self, addr: &SocketAddr) -> Result<SocketAddr>;
@@ -162,7 +165,7 @@ pub enum BaseServerStrategy {
 pub enum ServerStrategy {
     Direct(BaseServerStrategy),
     Many(BaseServerStrategy),
-    Demux(HashMap<u32, ServerStrategy>),
+    Demux(BTreeMap<u32, ServerStrategy>),
     /// AppendOnlyVec has a quite large inline array, so we box it.
     Merge(Box<AppendOnlyVec<ServerStrategy>>),
     Tagged(Box<ServerStrategy>, u32),

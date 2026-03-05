@@ -1,16 +1,16 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![warn(missing_docs)]
+#![cfg_attr(not(stageleft_trybuild), warn(missing_docs))]
 
 //! Hydro is a high-level distributed programming framework for Rust.
 //! Hydro can help you quickly write scalable distributed services that are correct by construction.
-//! Much like Rust helps with memory safety, Hydro helps with [distributed safety](https://hydro.run/docs/hydro/correctness).
+//! Much like Rust helps with memory safety, Hydro helps with [distributed safety](https://hydro.run/docs/hydro/reference/correctness).
 //!
-//! The core Hydro API involves [live collections](https://hydro.run/docs/hydro/live-collections/), which represent asynchronously
+//! The core Hydro API involves [live collections](https://hydro.run/docs/hydro/reference/live-collections/), which represent asynchronously
 //! updated sources of data such as incoming network requests and application state. The most common live collection is
 //! [`live_collections::stream::Stream`]; other live collections can be found in [`live_collections`].
 //!
 //! Hydro uses a unique compilation approach where you define deployment logic as Rust code alongside your distributed system implementation.
-//! For more details on this API, see the [Hydro docs](https://hydro.run/docs/hydro/deploy/) and the [`deploy`] module.
+//! For more details on this API, see the [Hydro docs](https://hydro.run/docs/hydro/reference/deploy/) and the [`deploy`] module.
 
 stageleft::stageleft_no_entry_crate!();
 
@@ -18,10 +18,14 @@ stageleft::stageleft_no_entry_crate!();
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime_support")))]
 #[doc(hidden)]
 pub mod runtime_support {
+    pub use ::{bincode, dfir_rs, slotmap, stageleft, tokio};
     #[cfg(feature = "sim")]
     pub use colored;
-    pub use {bincode, dfir_rs, stageleft, tokio};
-    pub mod resource_measurement;
+    #[cfg(feature = "deploy_integration")]
+    pub use hydro_deploy_integration;
+
+    #[cfg(any(feature = "deploy_integration", feature = "docker_runtime"))]
+    pub mod launch;
 }
 
 #[doc(hidden)]
@@ -52,7 +56,9 @@ pub mod prelude {
     pub use crate::live_collections::sliced::sliced;
     pub use crate::live_collections::stream::Stream;
     pub use crate::location::{Cluster, External, Location as _, Process, Tick};
+    pub use crate::networking::TCP;
     pub use crate::nondet::{NonDet, nondet};
+    pub use crate::properties::{ManualProof, manual_proof};
 
     /// A macro to set up a Hydro crate.
     #[macro_export]
@@ -81,9 +87,11 @@ pub mod live_collections;
 
 pub mod location;
 
-pub mod telemetry;
+pub mod networking;
 
-pub mod tests;
+pub mod properties;
+
+pub mod telemetry;
 
 #[cfg(any(
     feature = "deploy",
@@ -102,11 +110,16 @@ pub mod compile;
 
 mod manual_expr;
 
+#[cfg(stageleft_runtime)]
 #[cfg(feature = "viz")]
 #[cfg_attr(docsrs, doc(cfg(feature = "viz")))]
 #[expect(missing_docs, reason = "TODO")]
 pub mod viz;
 
+#[cfg_attr(
+    feature = "stageleft_macro_entrypoint",
+    expect(missing_docs, reason = "staging internals")
+)]
 mod staging_util;
 
 #[cfg(feature = "deploy")]
@@ -128,4 +141,82 @@ mod test_init {
     fn init() {
         crate::compile::init_test();
     }
+}
+
+/// Creates a newtype wrapper around an integer type.
+///
+/// Usage:
+/// ```rust
+/// hydro_lang::newtype_counter! {
+///     /// My counter.
+///     pub struct MyCounter(u32);
+///
+///     /// My secret counter.
+///     struct SecretCounter(u64);
+/// }
+/// ```
+#[doc(hidden)]
+#[macro_export]
+macro_rules! newtype_counter {
+    (
+        $(
+            $( #[$attr:meta] )*
+            $vis:vis struct $name:ident($typ:ty);
+        )*
+    ) => {
+        $(
+            $( #[$attr] )*
+            #[repr(transparent)]
+            #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+            $vis struct $name($typ);
+
+            #[allow(clippy::allow_attributes, dead_code, reason = "macro-generated methods may be unused")]
+            impl $name {
+                /// Gets the current ID and increments for the next.
+                pub fn get_and_increment(&mut self) -> Self {
+                    let id = self.0;
+                    self.0 += 1;
+                    Self(id)
+                }
+
+                /// Returns an iterator from zero up to (but excluding) `self`.
+                ///
+                /// This is useful for iterating already-allocated values.
+                pub fn range_up_to(&self) -> impl std::iter::DoubleEndedIterator<Item = Self>
+                    + std::iter::FusedIterator
+                {
+                    (0..self.0).map(Self)
+                }
+
+                /// Reveals the inner ID.
+                pub fn into_inner(self) -> $typ {
+                    self.0
+                }
+            }
+
+            impl std::fmt::Display for $name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "{}", self.0)
+                }
+            }
+
+            impl serde::ser::Serialize for $name {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer
+                {
+                    serde::ser::Serialize::serialize(&self.0, serializer)
+                }
+            }
+
+            impl<'de> serde::de::Deserialize<'de> for $name {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: serde::Deserializer<'de>
+                {
+                    serde::de::Deserialize::deserialize(deserializer).map(Self)
+                }
+            }
+        )*
+    };
 }

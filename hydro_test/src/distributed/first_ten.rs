@@ -21,7 +21,7 @@ pub fn first_ten_distributed<'a>(
     let numbers = process.source_iter(q!(0..10));
     numbers
         .map(q!(|n| SendOverNetwork { n }))
-        .send_bincode(second_process)
+        .send(second_process, TCP.fail_stop().bincode())
         .for_each(q!(|n| println!("{}", n.n)));
 
     numbers_external_port
@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn first_ten_distributed_ir() {
-        let builder = hydro_lang::compile::builder::FlowBuilder::new();
+        let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
         let external = builder.external();
         let p1 = builder.process();
         let p2 = builder.process();
@@ -48,7 +48,7 @@ mod tests {
     async fn first_ten_distributed() {
         let mut deployment = Deployment::new();
 
-        let builder = hydro_lang::compile::builder::FlowBuilder::new();
+        let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
         let external = builder.external();
         let p1 = builder.process();
         let p2 = builder.process();
@@ -71,7 +71,7 @@ mod tests {
         deployment.start().await.unwrap();
 
         external_port
-            .send("this is some string".to_string())
+            .send("this is some string".to_owned())
             .await
             .unwrap();
         assert_eq!(

@@ -4,31 +4,36 @@
 mod tests {
     use std::collections::HashSet;
 
-    #[cfg(test)]
     use hydro_build_utils::insta;
 
+    use crate::location::{LocationKey, LocationType};
     use crate::viz::json::HydroJson;
     use crate::viz::render::{
-        HydroEdgeProp, HydroGraphWrite, HydroNodeType, HydroWriteConfig, NodeLabel,
+        HydroEdgeProp, HydroGraphWrite, HydroNodeType, HydroWriteConfig, NodeLabel, VizNodeKey,
     };
 
     #[test]
     fn test_json_structure_with_semantic_tags() {
         let mut output = String::new();
         let config = HydroWriteConfig::default();
-        let mut writer = HydroJson::new(&mut output, &config);
+        let mut writer: HydroJson<'_, &mut String> = HydroJson::new(&mut output, config);
 
         // Write a simple graph
         writer.write_prologue().unwrap();
 
+        let node_id_1 = VizNodeKey::TEST_KEY_1;
+        let node_id_2 = VizNodeKey::TEST_KEY_2;
+
+        let loc_key_1 = LocationKey::TEST_KEY_1;
+
         // Add a source node
         writer
             .write_node_definition(
-                0,
-                &NodeLabel::Static("source".to_string()),
+                node_id_1,
+                &NodeLabel::Static("source".to_owned()),
                 HydroNodeType::Source,
-                Some(0),
-                Some("Process"),
+                Some(loc_key_1),
+                Some(LocationType::Process),
                 None,
             )
             .unwrap();
@@ -36,11 +41,11 @@ mod tests {
         // Add a transform node
         writer
             .write_node_definition(
-                1,
-                &NodeLabel::Static("map".to_string()),
+                node_id_2,
+                &NodeLabel::Static("map".to_owned()),
                 HydroNodeType::Transform,
-                Some(0),
-                Some("Process"),
+                Some(loc_key_1),
+                Some(LocationType::Process),
                 None,
             )
             .unwrap();
@@ -51,7 +56,9 @@ mod tests {
         edge_props.insert(HydroEdgeProp::Unbounded);
         edge_props.insert(HydroEdgeProp::TotalOrder);
 
-        writer.write_edge(0, 1, &edge_props, None).unwrap();
+        writer
+            .write_edge(node_id_1, node_id_2, &edge_props, None)
+            .unwrap();
 
         writer.write_epilogue().unwrap();
 
@@ -63,14 +70,16 @@ mod tests {
     fn test_empty_semantic_tags() {
         let mut output = String::new();
         let config = HydroWriteConfig::default();
-        let mut writer = HydroJson::new(&mut output, &config);
+        let mut writer = HydroJson::new(&mut output, config);
 
         writer.write_prologue().unwrap();
 
+        let node_id_1 = VizNodeKey::TEST_KEY_1;
+
         writer
             .write_node_definition(
-                0,
-                &NodeLabel::Static("node".to_string()),
+                node_id_1,
+                &NodeLabel::Static("node".to_owned()),
                 HydroNodeType::Transform,
                 None,
                 None,
@@ -80,7 +89,9 @@ mod tests {
 
         // Edge with no properties
         let edge_props = HashSet::new();
-        writer.write_edge(0, 0, &edge_props, None).unwrap();
+        writer
+            .write_edge(node_id_1, node_id_1, &edge_props, None)
+            .unwrap();
 
         writer.write_epilogue().unwrap();
 
@@ -94,57 +105,65 @@ mod tests {
         let mut output1 = String::new();
         let mut output2 = String::new();
         let config = HydroWriteConfig::default();
-        let mut w1 = HydroJson::new(&mut output1, &config);
-        let mut w2 = HydroJson::new(&mut output2, &config);
+        let mut w1 = HydroJson::new(&mut output1, config);
+        let mut w2 = HydroJson::new(&mut output2, config);
 
         // Build same small graph with two locations to force Network tag
         let mut edge_props = HashSet::new();
         edge_props.insert(HydroEdgeProp::Stream);
 
+        let node_id_1 = VizNodeKey::TEST_KEY_1;
+        let node_id_2 = VizNodeKey::TEST_KEY_2;
+
+        let loc_key_1 = LocationKey::TEST_KEY_1;
+        let loc_key_2 = LocationKey::TEST_KEY_2;
+
         // Graph 1
         w1.write_prologue().unwrap();
         w1.write_node_definition(
-            0,
+            node_id_1,
             &NodeLabel::Static("a".into()),
             HydroNodeType::Source,
-            Some(0),
-            Some("Process"),
+            Some(loc_key_1),
+            Some(LocationType::Process),
             None,
         )
         .unwrap();
         w1.write_node_definition(
-            1,
+            node_id_2,
             &NodeLabel::Static("b".into()),
             HydroNodeType::Transform,
-            Some(1),
-            Some("Process"),
+            Some(loc_key_2),
+            Some(LocationType::Process),
             None,
         )
         .unwrap();
-        w1.write_edge(0, 1, &edge_props, None).unwrap();
+        w1.write_edge(node_id_1, node_id_2, &edge_props, None)
+            .unwrap();
         w1.write_epilogue().unwrap();
 
         // Graph 2 (same operations, different insertion order to test determinism)
         w2.write_prologue().unwrap();
         w2.write_node_definition(
-            1,
+            node_id_2,
             &NodeLabel::Static("b".into()),
             HydroNodeType::Transform,
-            Some(1),
-            Some("Process"),
+            Some(loc_key_2),
+            Some(LocationType::Process),
             None,
         )
         .unwrap();
         w2.write_node_definition(
-            0,
+            node_id_1,
             &NodeLabel::Static("a".into()),
             HydroNodeType::Source,
-            Some(0),
-            Some("Process"),
+            Some(loc_key_1),
+            Some(LocationType::Process),
             None,
         )
         .unwrap();
-        w2.write_edge(0, 1, &edge_props, None).unwrap();
+        w2.write_edge(node_id_1, node_id_2, &edge_props, None)
+            .unwrap();
         w2.write_epilogue().unwrap();
 
         // Verify deterministic output

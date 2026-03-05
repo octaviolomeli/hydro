@@ -3,8 +3,10 @@ hydro_lang::setup!();
 
 pub mod cluster;
 pub mod distributed;
+pub mod embedded;
 pub mod external_client;
 pub mod local;
+pub mod maelstrom;
 pub mod tutorials;
 
 #[doc(hidden)]

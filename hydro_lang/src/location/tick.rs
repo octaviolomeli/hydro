@@ -1,23 +1,45 @@
-use std::marker::PhantomData;
+//! Clock domains for batching streaming data into discrete time steps.
+//!
+//! In Hydro, a [`Tick`] represents a logical clock that can be used to batch
+//! unbounded streaming data into discrete, bounded time steps. This is essential
+//! for implementing iterative algorithms, synchronizing data across multiple
+//! streams, and performing aggregations over windows of data.
+//!
+//! A tick is created from a top-level location (such as [`Process`] or [`Cluster`])
+//! using [`Location::tick`]. Once inside a tick, bounded live collections can be
+//! manipulated with operations like fold, reduce, and cross-product, and the
+//! results can be emitted back to the unbounded stream using methods like
+//! `all_ticks()`.
+//!
+//! The [`Atomic`] wrapper provides atomicity guarantees within a tick, ensuring
+//! that reads and writes within a tick are serialized.
+//!
+//! The [`NoTick`] marker trait is used to constrain APIs that should only be
+//! called on top-level locations (not inside a tick), while [`NoAtomic`] constrains
+//! APIs that should not be called inside an atomic context.
 
-use proc_macro2::Span;
 use sealed::sealed;
 use stageleft::{QuotedWithContext, q};
 
 #[cfg(stageleft_runtime)]
 use super::dynamic::DynLocation;
 use super::{Cluster, Location, LocationId, Process};
-use crate::compile::builder::FlowState;
+use crate::compile::builder::{ClockId, FlowState};
 use crate::compile::ir::{HydroNode, HydroSource};
 #[cfg(stageleft_runtime)]
 use crate::forward_handle::{CycleCollection, CycleCollectionWithInitial};
-use crate::forward_handle::{ForwardHandle, ForwardRef, TickCycle, TickCycleHandle};
+use crate::forward_handle::{TickCycle, TickCycleHandle};
 use crate::live_collections::boundedness::{Bounded, Unbounded};
 use crate::live_collections::optional::Optional;
 use crate::live_collections::singleton::Singleton;
 use crate::live_collections::stream::{ExactlyOnce, Stream, TotalOrder};
 use crate::nondet::nondet;
 
+/// Marker trait for locations that are **not** inside a [`Tick`] clock domain.
+///
+/// This trait is implemented by top-level locations such as [`Process`] and [`Cluster`],
+/// as well as [`Atomic`]. It is used to constrain APIs that should only be called
+/// outside of a tick context (e.g., creating a new tick or sourcing external data).
 #[sealed]
 pub trait NoTick {}
 #[sealed]
@@ -25,6 +47,11 @@ impl<T> NoTick for Process<'_, T> {}
 #[sealed]
 impl<T> NoTick for Cluster<'_, T> {}
 
+/// Marker trait for locations that are **not** inside an [`Atomic`] context.
+///
+/// This trait is implemented by top-level locations ([`Process`], [`Cluster`]) and
+/// by [`Tick`]. It is used to constrain APIs that should not be called from within
+/// an atomic block.
 #[sealed]
 pub trait NoAtomic {}
 #[sealed]
@@ -34,6 +61,16 @@ impl<T> NoAtomic for Cluster<'_, T> {}
 #[sealed]
 impl<'a, L> NoAtomic for Tick<L> where L: Location<'a> {}
 
+/// A location wrapper that provides atomicity guarantees within a [`Tick`].
+///
+/// An `Atomic` context establishes a happens-before relationship between operations:
+/// - Downstream computations from `atomic(&tick)` are associated with that tick
+/// - Outputs from `end_atomic()` are held until all computations in the tick complete
+/// - Snapshots via `use::atomic` are guaranteed to reflect all updates from associated `end_atomic()`
+///
+/// This ensures read-after-write consistency: if a client receives an acknowledgement
+/// from `end_atomic()`, any subsequent `use::atomic` snapshot will include the effects
+/// of that acknowledged operation.
 #[derive(Clone)]
 pub struct Atomic<Loc> {
     pub(crate) tick: Tick<Loc>,
@@ -51,6 +88,10 @@ impl<L: DynLocation> DynLocation for Atomic<L> {
     fn is_top_level() -> bool {
         L::is_top_level()
     }
+
+    fn multiversioned(&self) -> bool {
+        self.tick.multiversioned()
+    }
 }
 
 impl<'a, L> Location<'a> for Atomic<L>
@@ -67,14 +108,22 @@ where
 #[sealed]
 impl<L> NoTick for Atomic<L> {}
 
+/// Trait for live collections that can be deferred by one tick.
+///
+/// When a collection implements `DeferTick`, calling `defer_tick` delays its
+/// values by one clock cycle. This is primarily used internally to implement
+/// tick-based cycles ([`Tick::cycle`]), ensuring that feedback loops advance
+/// by one tick to avoid infinite recursion within a single tick.
 pub trait DeferTick {
+    /// Returns a new collection whose values are delayed by one tick.
     fn defer_tick(self) -> Self;
 }
 
 /// Marks the stream as being inside the single global clock domain.
 #[derive(Clone)]
 pub struct Tick<L> {
-    pub(crate) id: usize,
+    pub(crate) id: ClockId,
+    /// Location.
     pub(crate) l: L,
 }
 
@@ -89,6 +138,10 @@ impl<L: DynLocation> DynLocation for Tick<L> {
 
     fn is_top_level() -> bool {
         false
+    }
+
+    fn multiversioned(&self) -> bool {
+        self.l.multiversioned()
     }
 }
 
@@ -107,10 +160,19 @@ impl<'a, L> Tick<L>
 where
     L: Location<'a>,
 {
+    /// Returns a reference to the outer (parent) location that this tick is nested within.
+    ///
+    /// For example, if a `Tick` was created from a `Process`, this returns a reference
+    /// to that `Process`.
     pub fn outer(&self) -> &L {
         &self.l
     }
 
+    /// Creates a bounded stream of `()` values inside this tick, with a fixed batch size.
+    ///
+    /// This is useful for driving computations inside a tick that need to process
+    /// a specific number of elements per tick. Each tick will produce exactly
+    /// `batch_size` unit values.
     pub fn spin_batch(
         &self,
         batch_size: impl QuotedWithContext<'a, usize, L> + Copy + 'a,
@@ -127,6 +189,10 @@ where
         out.batch(self, nondet!(/** at runtime, `spin` produces a single value per tick, so each batch is guaranteed to be the same size. */))
     }
 
+    /// Constructs a [`Singleton`] materialized inside this tick with the given static value.
+    ///
+    /// The singleton will have the provided value on every tick. This is useful
+    /// for providing constant values to computations inside a tick.
     pub fn singleton<T>(
         &self,
         e: impl QuotedWithContext<'a, T, Tick<L>>,
@@ -224,29 +290,14 @@ where
         )
     }
 
-    #[expect(
-        private_bounds,
-        reason = "only Hydro collections can implement ReceiverComplete"
-    )]
-    pub fn forward_ref<S>(&self) -> (ForwardHandle<'a, S>, S)
-    where
-        S: CycleCollection<'a, ForwardRef, Location = Self>,
-        L: NoTick,
-    {
-        let next_id = self.flow_state().borrow_mut().next_cycle_id();
-        let ident = syn::Ident::new(&format!("cycle_{}", next_id), Span::call_site());
-
-        (
-            ForwardHandle {
-                completed: false,
-                ident: ident.clone(),
-                expected_location: Location::id(self),
-                _phantom: PhantomData,
-            },
-            S::create_source(ident, self.clone()),
-        )
-    }
-
+    /// Creates a feedback cycle within this tick for implementing iterative computations.
+    ///
+    /// Returns a handle that must be completed with the actual collection, and a placeholder
+    /// collection that represents the output of the previous tick (deferred by one tick).
+    /// This is useful for implementing fixed-point computations where the output of one
+    /// tick feeds into the input of the next.
+    ///
+    /// The cycle automatically defers values by one tick to prevent infinite recursion.
     #[expect(
         private_bounds,
         reason = "only Hydro collections can implement ReceiverComplete"
@@ -256,20 +307,19 @@ where
         S: CycleCollection<'a, TickCycle, Location = Self> + DeferTick,
         L: NoTick,
     {
-        let next_id = self.flow_state().borrow_mut().next_cycle_id();
-        let ident = syn::Ident::new(&format!("cycle_{}", next_id), Span::call_site());
-
+        let cycle_id = self.flow_state().borrow_mut().next_cycle_id();
         (
-            TickCycleHandle {
-                completed: false,
-                ident: ident.clone(),
-                expected_location: Location::id(self),
-                _phantom: PhantomData,
-            },
-            S::create_source(ident, self.clone()).defer_tick(),
+            TickCycleHandle::new(cycle_id, Location::id(self)),
+            S::create_source(cycle_id, self.clone()).defer_tick(),
         )
     }
 
+    /// Creates a feedback cycle with an initial value for the first tick.
+    ///
+    /// Similar to [`Tick::cycle`], but allows providing an initial collection
+    /// that will be used as the value on the first tick before any feedback
+    /// is available. This is useful for bootstrapping iterative computations
+    /// that need a starting state.
     #[expect(
         private_bounds,
         reason = "only Hydro collections can implement ReceiverComplete"
@@ -278,18 +328,11 @@ where
     where
         S: CycleCollectionWithInitial<'a, TickCycle, Location = Self>,
     {
-        let next_id = self.flow_state().borrow_mut().next_cycle_id();
-        let ident = syn::Ident::new(&format!("cycle_{}", next_id), Span::call_site());
-
+        let cycle_id = self.flow_state().borrow_mut().next_cycle_id();
         (
-            TickCycleHandle {
-                completed: false,
-                ident: ident.clone(),
-                expected_location: Location::id(self),
-                _phantom: PhantomData,
-            },
+            TickCycleHandle::new(cycle_id, Location::id(self)),
             // no need to defer_tick, create_source_with_initial does it for us
-            S::create_source_with_initial(ident, initial, self.clone()),
+            S::create_source_with_initial(cycle_id, initial, self.clone()),
         )
     }
 }
@@ -311,7 +354,7 @@ mod tests {
     #[cfg(feature = "sim")]
     #[test]
     fn sim_atomic_stream() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (write_send, write_req) = node.sim_input();
@@ -359,7 +402,7 @@ mod tests {
     #[should_panic]
     fn sim_non_atomic_stream() {
         // shows that atomic is necessary
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (write_send, write_req) = node.sim_input();

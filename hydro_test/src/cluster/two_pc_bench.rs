@@ -1,39 +1,58 @@
 use hydro_lang::prelude::*;
-use hydro_std::bench_client::{bench_client, print_bench_results};
+use hydro_std::bench_client::{
+    BenchResult, aggregate_bench_results, bench_client, compute_throughput_latency,
+};
 
 use super::two_pc::{Coordinator, Participant};
-use crate::cluster::paxos_bench::inc_u32_workload_generator;
+use crate::cluster::paxos_bench::inc_i32_workload_generator;
 use crate::cluster::two_pc::two_pc;
 
 pub struct Client;
 pub struct Aggregator;
 
+#[expect(clippy::too_many_arguments, reason = "internal 2PC code // TODO")]
 pub fn two_pc_bench<'a>(
-    num_clients_per_node: usize,
     coordinator: &Process<'a, Coordinator>,
     participants: &Cluster<'a, Participant>,
     num_participants: usize,
     clients: &Cluster<'a, Client>,
+    num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     client_aggregator: &Process<'a, Aggregator>,
+    client_interval_millis: u64,
+    aggregate_interval_millis: u64,
+    print_results: impl FnOnce(BenchResult<Process<'a, Aggregator>>),
 ) {
-    let bench_results = bench_client(
+    let latencies = bench_client(
         clients,
-        inc_u32_workload_generator,
-        |payloads| {
-            // Send committed requests back to the original client
+        num_clients_per_node,
+        inc_i32_workload_generator,
+        |input| {
             two_pc(
                 coordinator,
                 participants,
                 num_participants,
-                payloads.send_bincode(coordinator).entries(),
+                input
+                    .entries()
+                    .send(coordinator, TCP.fail_stop().bincode())
+                    .entries(),
             )
-            .demux_bincode(clients)
+            .demux(clients, TCP.fail_stop().bincode())
+            .into_keyed()
         },
-        num_clients_per_node,
+    )
+    .entries()
+    .map(q!(|(_virtual_client_id, (_output, latency))| latency));
+
+    // Create throughput/latency graphs
+    let bench_results = compute_throughput_latency(
+        clients,
+        latencies,
+        client_interval_millis,
         nondet!(/** bench */),
     );
-
-    print_bench_results(bench_results, client_aggregator, clients);
+    let aggregate_results =
+        aggregate_bench_results(bench_results, client_aggregator, aggregate_interval_millis);
+    print_results(aggregate_results);
 }
 
 #[cfg(test)]
@@ -59,26 +78,33 @@ mod tests {
         clients: &Cluster<'a, Client>,
         client_aggregator: &Process<'a, Aggregator>,
     ) {
+        use hydro_lang::location::Location;
+        use hydro_std::bench_client::pretty_print_bench_results;
+        use stageleft::q;
+
         super::two_pc_bench(
-            100,
             coordinator,
             participants,
             NUM_PARTICIPANTS,
             clients,
+            clients.singleton(q!(100usize)),
             client_aggregator,
+            100,
+            1000,
+            pretty_print_bench_results,
         );
     }
 
     #[test]
     fn two_pc_ir() {
-        let builder = hydro_lang::compile::builder::FlowBuilder::new();
+        let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
         let coordinator = builder.process();
         let participants = builder.cluster();
         let clients = builder.cluster();
         let client_aggregator = builder.process();
 
         create_two_pc(&coordinator, &participants, &clients, &client_aggregator);
-        let built = builder.with_default_optimize::<HydroDeploy>();
+        let mut built = builder.with_default_optimize::<HydroDeploy>();
 
         hydro_lang::compile::ir::dbg_dedup_tee(|| {
             hydro_build_utils::assert_debug_snapshot!(built.ir());
@@ -117,7 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_pc_some_throughput() {
-        let builder = hydro_lang::compile::builder::FlowBuilder::new();
+        let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
         let coordinator = builder.process();
         let participants = builder.cluster();
         let clients = builder.cluster();
@@ -150,7 +176,7 @@ mod tests {
 
         use regex::Regex;
 
-        let re = Regex::new(r"Throughput: ([^ ]+) - ([^ ]+) - ([^ ]+) requests/s").unwrap();
+        let re = Regex::new(r"Throughput: ([^ ]+) requests/s").unwrap();
         let mut found = 0;
         let mut client_out = client_out;
         while let Some(line) = client_out.recv().await {

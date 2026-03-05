@@ -297,6 +297,10 @@ impl Fleet {
     pub async fn run_single_tick_all_hosts(&mut self) -> bool {
         let mut work_done: bool = false;
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "nondeterministic iteration order, TODO(mingwei)"
+        )]
         for (name, host) in self.hosts.iter_mut() {
             trace!("Running tick for host: {}", name);
             work_done |= host.run_tick().await;
@@ -315,6 +319,10 @@ impl Fleet {
         let mut all_messages: Vec<(Address, MessageWithAddress)> = Vec::new();
 
         // Collect all messages from all outboxes on all hosts.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "nondeterministic iteration order, TODO(mingwei)"
+        )]
         for (name, host) in self.hosts.iter_mut() {
             for (interface, output) in host.output.iter_mut() {
                 let src_address = Address::new(name.clone(), interface.clone());
@@ -375,11 +383,11 @@ mod tests {
         let mut fleet = Fleet::new();
 
         // Hostnames for the server and client
-        let server: Hostname = "server".to_string();
-        let client: Hostname = "client".to_string();
+        let server: Hostname = "server".to_owned();
+        let client: Hostname = "client".to_owned();
 
         // Interface name for the echo "protocol"
-        let interface: String = "echo".to_string();
+        let interface: String = "echo".to_owned();
 
         let server_address = Address::new(server.clone(), interface.clone());
 
@@ -420,7 +428,7 @@ mod tests {
         });
 
         // Trigger the client to send a message.
-        client_trigger_tx.send("Hello, world!".to_string()).unwrap();
+        client_trigger_tx.send("Hello, world!".to_owned()).unwrap();
 
         // Run the simulation until no new work is done by any host.
         fleet.run_until_quiescent().await;

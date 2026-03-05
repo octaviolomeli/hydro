@@ -29,14 +29,15 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{Instrument, instrument, trace, warn};
 
 use super::deploy_runtime_containerized::*;
+use crate::compile::builder::ExternalPortId;
 use crate::compile::deploy::DeployResult;
 use crate::compile::deploy_provider::{
     ClusterSpec, Deploy, ExternalSpec, Node, ProcessSpec, RegisterPort,
 };
-use crate::compile::trybuild::generate::create_graph_trybuild;
+use crate::compile::trybuild::generate::{LinkingMode, create_graph_trybuild};
 use crate::location::dynamic::LocationId;
 use crate::location::member_id::TaglessMemberId;
-use crate::location::{MembershipEvent, NetworkHint};
+use crate::location::{LocationKey, MembershipEvent, NetworkHint};
 
 /// represents a docker network
 #[derive(Clone, Debug)]
@@ -56,7 +57,7 @@ impl DockerNetwork {
 /// Represents a process running in a docker container
 #[derive(Clone)]
 pub struct DockerDeployProcess {
-    id: usize,
+    key: LocationKey,
     name: String,
     next_port: Rc<RefCell<u16>>,
     rust_crate: Rc<RefCell<Option<RustCrate>>>,
@@ -77,7 +78,7 @@ impl Node for DockerDeployProcess {
     type Meta = ();
     type InstantiateEnv = DockerDeploy;
 
-    #[instrument(level = "trace", skip_all, ret, fields(id = self.id, name = self.name))]
+    #[instrument(level = "trace", skip_all, ret, fields(key = %self.key, name = self.name))]
     fn next_port(&self) -> Self::Port {
         let port = {
             let mut borrow = self.next_port.borrow_mut();
@@ -89,28 +90,35 @@ impl Node for DockerDeployProcess {
         port
     }
 
-    #[instrument(level = "trace", skip_all, fields(id = self.id, name = self.name))]
+    #[instrument(level = "trace", skip_all, fields(key = %self.key, name = self.name))]
     fn update_meta(&self, _meta: &Self::Meta) {}
 
-    #[instrument(level = "trace", skip_all, fields(id = self.id, name = self.name, ?meta, extra_stmts = extra_stmts.len()))]
+    #[instrument(level = "trace", skip_all, fields(key = %self.key, name = self.name, ?meta, extra_stmts = extra_stmts.len(), sidecars = sidecars.len()))]
     fn instantiate(
         &self,
         _env: &mut Self::InstantiateEnv,
         meta: &mut Self::Meta,
         graph: DfirGraph,
-        extra_stmts: Vec<syn::Stmt>,
+        extra_stmts: &[syn::Stmt],
+        sidecars: &[syn::Expr],
     ) {
-        let (bin_name, config) =
-            create_graph_trybuild(graph, extra_stmts, &Some(self.name.clone()), true);
+        let (bin_name, config) = create_graph_trybuild(
+            graph,
+            extra_stmts,
+            sidecars,
+            Some(&self.name),
+            crate::compile::trybuild::generate::DeployMode::Containerized,
+            LinkingMode::Static,
+        );
 
-        let mut ret = RustCrate::new(config.project_dir)
+        let mut ret = RustCrate::new(&config.project_dir, &config.project_dir)
             .target_dir(config.target_dir)
-            .example(bin_name.clone())
+            .example(bin_name)
             .no_default_features();
 
         ret = ret.display_name("test_display_name");
 
-        ret = ret.features(vec!["hydro___feature_docker_runtime".to_string()]);
+        ret = ret.features(vec!["hydro___feature_docker_runtime".to_owned()]);
 
         if let Some(features) = config.features {
             ret = ret.features(features);
@@ -126,7 +134,7 @@ impl Node for DockerDeployProcess {
 /// Represents a logical cluster, which can be a variable amount of individual containers.
 #[derive(Clone)]
 pub struct DockerDeployCluster {
-    id: usize,
+    key: LocationKey,
     name: String,
     next_port: Rc<RefCell<u16>>,
     rust_crate: Rc<RefCell<Option<RustCrate>>>,
@@ -145,7 +153,7 @@ impl Node for DockerDeployCluster {
     type Meta = ();
     type InstantiateEnv = DockerDeploy;
 
-    #[instrument(level = "trace", skip_all, ret, fields(id = self.id, name = self.name))]
+    #[instrument(level = "trace", skip_all, ret, fields(key = %self.key, name = self.name))]
     fn next_port(&self) -> Self::Port {
         let port = {
             let mut borrow = self.next_port.borrow_mut();
@@ -157,28 +165,35 @@ impl Node for DockerDeployCluster {
         port
     }
 
-    #[instrument(level = "trace", skip_all, fields(id = self.id, name = self.name))]
+    #[instrument(level = "trace", skip_all, fields(key = %self.key, name = self.name))]
     fn update_meta(&self, _meta: &Self::Meta) {}
 
-    #[instrument(level = "trace", skip_all, fields(id = self.id, name = self.name, extra_stmts = extra_stmts.len()))]
+    #[instrument(level = "trace", skip_all, fields(key = %self.key, name = self.name, extra_stmts = extra_stmts.len()))]
     fn instantiate(
         &self,
         _env: &mut Self::InstantiateEnv,
         _meta: &mut Self::Meta,
         graph: DfirGraph,
-        extra_stmts: Vec<syn::Stmt>,
+        extra_stmts: &[syn::Stmt],
+        sidecars: &[syn::Expr],
     ) {
-        let (bin_name, config) =
-            create_graph_trybuild(graph, extra_stmts, &Some(self.name.clone()), true);
+        let (bin_name, config) = create_graph_trybuild(
+            graph,
+            extra_stmts,
+            sidecars,
+            Some(&self.name),
+            crate::compile::trybuild::generate::DeployMode::Containerized,
+            LinkingMode::Static,
+        );
 
-        let mut ret = RustCrate::new(config.project_dir)
+        let mut ret = RustCrate::new(&config.project_dir, &config.project_dir)
             .target_dir(config.target_dir)
-            .example(bin_name.clone())
+            .example(bin_name)
             .no_default_features();
 
         ret = ret.display_name("test_display_name");
 
-        ret = ret.features(vec!["hydro___feature_deploy_integration".to_string()]);
+        ret = ret.features(vec!["hydro___feature_docker_runtime".to_owned()]);
 
         if let Some(features) = config.features {
             ret = ret.features(features);
@@ -197,7 +212,7 @@ pub struct DockerDeployExternal {
     name: String,
     next_port: Rc<RefCell<u16>>,
 
-    ports: Rc<RefCell<HashMap<usize, u16>>>,
+    ports: Rc<RefCell<HashMap<ExternalPortId, u16>>>,
 
     #[expect(clippy::type_complexity, reason = "internal code")]
     connection_info: Rc<RefCell<HashMap<u16, (Rc<RefCell<Option<String>>>, u16, DockerNetwork)>>>,
@@ -223,13 +238,14 @@ impl Node for DockerDeployExternal {
     #[instrument(level = "trace", skip_all, fields(name = self.name))]
     fn update_meta(&self, _meta: &Self::Meta) {}
 
-    #[instrument(level = "trace", skip_all, fields(name = self.name, ?meta, extra_stmts = extra_stmts.len()))]
+    #[instrument(level = "trace", skip_all, fields(name = self.name, ?meta, extra_stmts = extra_stmts.len(), sidecars = sidecars.len()))]
     fn instantiate(
         &self,
         _env: &mut Self::InstantiateEnv,
         meta: &mut Self::Meta,
         graph: DfirGraph,
-        extra_stmts: Vec<syn::Stmt>,
+        extra_stmts: &[syn::Stmt],
+        sidecars: &[syn::Expr],
     ) {
         trace!(name: "surface", surface = graph.surface_syntax_string());
     }
@@ -241,48 +257,120 @@ type DynSourceSink<Out, In, InErr> = (
 );
 
 impl<'a> RegisterPort<'a, DockerDeploy> for DockerDeployExternal {
-    #[instrument(level = "trace", skip_all, fields(name = self.name, %key, %port))]
-    fn register(&self, key: usize, port: <DockerDeploy as Deploy>::Port) {
-        self.ports.borrow_mut().insert(key, port);
-    }
-
-    #[instrument(level = "trace", skip_all, fields(name = self.name, %key))]
-    fn raw_port(&self, key: usize) -> <DockerDeploy as Deploy<'a>>::ExternalRawPort {
-        todo!()
+    #[instrument(level = "trace", skip_all, fields(name = self.name, %external_port_id, %port))]
+    fn register(&self, external_port_id: ExternalPortId, port: Self::Port) {
+        self.ports.borrow_mut().insert(external_port_id, port);
     }
 
     fn as_bytes_bidi(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<
         Output = DynSourceSink<Result<bytes::BytesMut, std::io::Error>, Bytes, std::io::Error>,
     > + 'a {
-        let _span = tracing::trace_span!("as_bytes_bidi", name = %self.name, %key).entered(); // the instrument macro doesn't work here because of lifetime issues?
-        async { todo!() }
+        let guard =
+            tracing::trace_span!("as_bytes_bidi", name = %self.name, %external_port_id).entered();
+
+        let local_port = *self.ports.borrow().get(&external_port_id).unwrap();
+        let (docker_container_name, remote_port, _) = self
+            .connection_info
+            .borrow()
+            .get(&local_port)
+            .unwrap()
+            .clone();
+
+        let docker_container_name = docker_container_name.borrow().as_ref().unwrap().clone();
+
+        async move {
+            let local_port =
+                find_dynamically_allocated_docker_port(&docker_container_name, remote_port).await;
+            let remote_ip_address = "localhost";
+
+            trace!(name: "as_bytes_bidi_connecting", to = %remote_ip_address, to_port = %local_port);
+
+            let stream = TcpStream::connect(format!("{remote_ip_address}:{local_port}"))
+                .await
+                .unwrap();
+
+            trace!(name: "as_bytes_bidi_connected", to = %remote_ip_address, to_port = %local_port);
+
+            let (rx, tx) = stream.into_split();
+
+            let source = Box::pin(
+                FramedRead::new(rx, LengthDelimitedCodec::new()),
+            ) as Pin<Box<dyn Stream<Item = Result<bytes::BytesMut, std::io::Error>>>>;
+
+            let sink = Box::pin(FramedWrite::new(tx, LengthDelimitedCodec::new()))
+                as Pin<Box<dyn Sink<Bytes, Error = std::io::Error>>>;
+
+            (source, sink)
+        }
+        .instrument(guard.exit())
     }
 
     fn as_bincode_bidi<InT, OutT>(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<Output = DynSourceSink<OutT, InT, std::io::Error>> + 'a
     where
         InT: serde::Serialize + 'static,
         OutT: serde::de::DeserializeOwned + 'static,
     {
-        let _span = tracing::trace_span!("as_bincode_bidi", name = %self.name, %key).entered(); // the instrument macro doesn't work here because of lifetime issues?
-        async { todo!() }
+        let guard =
+            tracing::trace_span!("as_bincode_bidi", name = %self.name, %external_port_id).entered();
+
+        let local_port = *self.ports.borrow().get(&external_port_id).unwrap();
+        let (docker_container_name, remote_port, _) = self
+            .connection_info
+            .borrow()
+            .get(&local_port)
+            .unwrap()
+            .clone();
+
+        let docker_container_name = docker_container_name.borrow().as_ref().unwrap().clone();
+
+        async move {
+            let local_port =
+                find_dynamically_allocated_docker_port(&docker_container_name, remote_port).await;
+            let remote_ip_address = "localhost";
+
+            trace!(name: "as_bincode_bidi_connecting", to = %remote_ip_address, to_port = %local_port);
+
+            let stream = TcpStream::connect(format!("{remote_ip_address}:{local_port}"))
+                .await
+                .unwrap();
+
+            trace!(name: "as_bincode_bidi_connected", to = %remote_ip_address, to_port = %local_port);
+
+            let (rx, tx) = stream.into_split();
+
+            let source = Box::pin(
+                FramedRead::new(rx, LengthDelimitedCodec::new())
+                    .map(|v| bincode::deserialize(&v.unwrap()).unwrap()),
+            ) as Pin<Box<dyn Stream<Item = OutT>>>;
+
+            let sink = Box::pin(
+                FramedWrite::new(tx, LengthDelimitedCodec::new()).with(move |v: InT| async move {
+                    Ok::<_, std::io::Error>(Bytes::from(bincode::serialize(&v).unwrap()))
+                }),
+            ) as Pin<Box<dyn Sink<InT, Error = std::io::Error>>>;
+
+            (source, sink)
+        }
+        .instrument(guard.exit())
     }
 
     fn as_bincode_sink<T>(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<Output = Pin<Box<dyn Sink<T, Error = std::io::Error>>>> + 'a
     where
         T: serde::Serialize + 'static,
     {
-        let guard = tracing::trace_span!("as_bincode_sink", name = %self.name, %key).entered();
+        let guard =
+            tracing::trace_span!("as_bincode_sink", name = %self.name, %external_port_id).entered();
 
-        let local_port = *self.ports.borrow().get(&key).unwrap();
+        let local_port = *self.ports.borrow().get(&external_port_id).unwrap();
         let (docker_container_name, remote_port, _) = self
             .connection_info
             .borrow()
@@ -323,14 +411,15 @@ impl<'a> RegisterPort<'a, DockerDeploy> for DockerDeployExternal {
 
     fn as_bincode_source<T>(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<Output = Pin<Box<dyn Stream<Item = T>>>> + 'a
     where
         T: serde::de::DeserializeOwned + 'static,
     {
-        let guard = tracing::trace_span!("as_bincode_sink", name = %self.name, %key).entered();
+        let guard =
+            tracing::trace_span!("as_bincode_sink", name = %self.name, %external_port_id).entered();
 
-        let local_port = *self.ports.borrow().get(&key).unwrap();
+        let local_port = *self.ports.borrow().get(&external_port_id).unwrap();
         let (docker_container_name, remote_port, _) = self
             .connection_info
             .borrow()
@@ -389,7 +478,7 @@ async fn find_dynamically_allocated_docker_port(
         .as_ref()
         .unwrap()
         .iter()
-        .find(|v| v.host_ip == Some("0.0.0.0".to_string()))
+        .find(|v| v.host_ip == Some("0.0.0.0".to_owned()))
         .unwrap()
         .host_port
         .as_ref()
@@ -417,12 +506,10 @@ async fn create_and_start_container(
     deployment_instance: &str,
 ) -> Result<(), anyhow::Error> {
     let config = ContainerCreateBody {
-        image: Some(image_name.to_string()),
-        hostname: Some(container_name.to_string()),
+        image: Some(image_name.to_owned()),
+        hostname: Some(container_name.to_owned()),
         host_config: Some(HostConfig {
-            binds: Some(vec![
-                "/var/run/docker.sock:/var/run/docker.sock".to_string(),
-            ]),
+            binds: Some(vec!["/var/run/docker.sock:/var/run/docker.sock".to_owned()]),
             publish_all_ports: Some(true),
             port_bindings: Some(HashMap::new()), /* Due to a bug in docker, if you don't send empty port bindings with publish_all_ports set to true and with a docker image that has EXPOSE directives in it, docker will crash because it will try to write to a map in memory that it has not initialized yet. Setting port_bindings explicitly to an empty map will initialize it first so that it does not break. */
             ..Default::default()
@@ -434,7 +521,7 @@ async fn create_and_start_container(
         ]),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
-                network_name.to_string(),
+                network_name.to_owned(),
                 EndpointSettings {
                     ..Default::default()
                 },
@@ -445,7 +532,7 @@ async fn create_and_start_container(
     };
 
     let options = CreateContainerOptions {
-        name: Some(container_name.to_string()),
+        name: Some(container_name.to_owned()),
         ..Default::default()
     };
 
@@ -461,7 +548,7 @@ async fn create_and_start_container(
 #[instrument(level = "trace", skip_all, fields(%image_name))]
 async fn build_and_create_image(
     rust_crate: &Rc<RefCell<Option<RustCrate>>>,
-    compilation_options: &Option<String>,
+    compilation_options: Option<&str>,
     config: &[String],
     exposed_ports: &[u16],
     image_name: &str,
@@ -470,7 +557,7 @@ async fn build_and_create_image(
         .borrow_mut()
         .take()
         .unwrap()
-        .rustflags(compilation_options.clone().unwrap_or("".to_string()));
+        .rustflags(compilation_options.unwrap_or_default());
 
     for cfg in config {
         rust_crate = rust_crate.config(cfg);
@@ -569,7 +656,7 @@ Failed to build crate {exit_status:?}
 
     let build_options = BuildImageOptions {
         dockerfile: "Dockerfile".to_owned(),
-        t: Some(image_name.to_string()),
+        t: Some(image_name.to_owned()),
         rm: true,
         ..Default::default()
     };
@@ -661,7 +748,7 @@ impl DockerDeploy {
 
             build_and_create_image(
                 &process.rust_crate,
-                &process.compilation_options,
+                process.compilation_options.as_deref(),
                 &process.config,
                 &exposed_ports,
                 &process.name,
@@ -672,7 +759,7 @@ impl DockerDeploy {
         for (_, _, cluster) in nodes.get_all_clusters() {
             build_and_create_image(
                 &cluster.rust_crate,
-                &cluster.compilation_options,
+                cluster.compilation_options.as_deref(),
                 &cluster.config,
                 &[], // clusters don't have exposed ports.
                 &cluster.name,
@@ -691,7 +778,7 @@ impl DockerDeploy {
         match docker
             .create_network(NetworkCreateRequest {
                 name: self.network.name.clone(),
-                driver: Some("bridge".to_string()),
+                driver: Some("bridge".to_owned()),
                 ..Default::default()
             })
             .await
@@ -811,54 +898,44 @@ impl DockerDeploy {
 }
 
 impl<'a> Deploy<'a> for DockerDeploy {
+    type Meta = ();
     type InstantiateEnv = Self;
+
     type Process = DockerDeployProcess;
     type Cluster = DockerDeployCluster;
     type External = DockerDeployExternal;
-    type Port = u16;
-    type ExternalRawPort = ();
-    type Meta = ();
-    type GraphId = ();
 
-    #[instrument(level = "trace", skip_all, ret)]
-    fn allocate_process_port(process: &Self::Process) -> Self::Port {
-        process.next_port()
-    }
-
-    #[instrument(level = "trace", skip_all, ret)]
-    fn allocate_cluster_port(cluster: &Self::Cluster) -> Self::Port {
-        cluster.next_port()
-    }
-
-    #[instrument(level = "trace", skip_all, ret)]
-    fn allocate_external_port(external: &Self::External) -> Self::Port {
-        external.next_port()
-    }
-
-    #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, p2 = p2.name, p2_port))]
+    #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, p2 = p2.name, %p2_port))]
     fn o2o_sink_source(
+        _env: &mut Self::InstantiateEnv,
         p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
+        name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
-        let bind_addr = format!("0.0.0.0:{}", p2_port);
-        let target = format!("{}:{p2_port}", p2.name);
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
 
-        deploy_containerized_o2o(target.as_str(), bind_addr.as_str())
+        deploy_containerized_o2o(
+            &p2.name,
+            name.expect("channel name is required for containerized deployment"),
+        )
     }
 
-    #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, p2 = p2.name, p2_port))]
+    #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, p2 = p2.name, %p2_port))]
     fn o2o_connect(
         p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
     ) -> Box<dyn FnOnce()> {
-        let serialized = format!(
-            "o2o_connect {}:{p1_port:?} -> {}:{p2_port:?}",
-            p1.name, p2.name
-        );
+        let serialized = format!("o2o_connect {}:{p1_port} -> {}:{p2_port}", p1.name, p2.name);
 
         Box::new(move || {
             trace!(name: "o2o_connect thunk", %serialized);
@@ -867,25 +944,34 @@ impl<'a> Deploy<'a> for DockerDeploy {
 
     #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, c2 = c2.name, %c2_port))]
     fn o2m_sink_source(
+        _env: &mut Self::InstantiateEnv,
         p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
+        name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
-        deploy_containerized_o2m(*c2_port)
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
+
+        deploy_containerized_o2m(
+            name.expect("channel name is required for containerized deployment"),
+        )
     }
 
     #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, c2 = c2.name, %c2_port))]
     fn o2m_connect(
         p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
     ) -> Box<dyn FnOnce()> {
-        let serialized = format!(
-            "o2m_connect {}:{p1_port:?} -> {}:{c2_port:?}",
-            p1.name, c2.name
-        );
+        let serialized = format!("o2m_connect {}:{p1_port} -> {}:{c2_port}", p1.name, c2.name);
 
         Box::new(move || {
             trace!(name: "o2m_connect thunk", %serialized);
@@ -894,25 +980,35 @@ impl<'a> Deploy<'a> for DockerDeploy {
 
     #[instrument(level = "trace", skip_all, fields(c1 = c1.name, %c1_port, p2 = p2.name, %p2_port))]
     fn m2o_sink_source(
+        _env: &mut Self::InstantiateEnv,
         c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
+        name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
-        deploy_containerized_m2o(*p2_port, &p2.name)
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
+
+        deploy_containerized_m2o(
+            &p2.name,
+            name.expect("channel name is required for containerized deployment"),
+        )
     }
 
     #[instrument(level = "trace", skip_all, fields(c1 = c1.name, %c1_port, p2 = p2.name, %p2_port))]
     fn m2o_connect(
         c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
     ) -> Box<dyn FnOnce()> {
-        let serialized = format!(
-            "o2m_connect {}:{c1_port:?} -> {}:{p2_port:?}",
-            c1.name, p2.name
-        );
+        let serialized = format!("o2m_connect {}:{c1_port} -> {}:{p2_port}", c1.name, p2.name);
 
         Box::new(move || {
             trace!(name: "m2o_connect thunk", %serialized);
@@ -921,25 +1017,34 @@ impl<'a> Deploy<'a> for DockerDeploy {
 
     #[instrument(level = "trace", skip_all, fields(c1 = c1.name, %c1_port, c2 = c2.name, %c2_port))]
     fn m2m_sink_source(
+        _env: &mut Self::InstantiateEnv,
         c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
+        name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
-        deploy_containerized_m2m(*c2_port)
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
+
+        deploy_containerized_m2m(
+            name.expect("channel name is required for containerized deployment"),
+        )
     }
 
     #[instrument(level = "trace", skip_all, fields(c1 = c1.name, %c1_port, c2 = c2.name, %c2_port))]
     fn m2m_connect(
         c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
     ) -> Box<dyn FnOnce()> {
-        let serialized = format!(
-            "m2m_connect {}:{c1_port:?} -> {}:{c2_port:?}",
-            c1.name, c2.name
-        );
+        let serialized = format!("m2m_connect {}:{c1_port} -> {}:{c2_port}", c1.name, c2.name);
 
         Box::new(move || {
             trace!(name: "m2m_connect thunk", %serialized);
@@ -950,25 +1055,63 @@ impl<'a> Deploy<'a> for DockerDeploy {
     fn e2o_many_source(
         extra_stmts: &mut Vec<syn::Stmt>,
         p2: &Self::Process,
-        p2_port: &Self::Port,
-        _codec_type: &syn::Type,
+        p2_port: &<Self::Process as Node>::Port,
+        codec_type: &syn::Type,
         shared_handle: String,
     ) -> syn::Expr {
-        todo!()
+        p2.exposed_ports.borrow_mut().push(*p2_port);
+
+        let socket_ident = syn::Ident::new(
+            &format!("__hydro_deploy_many_{}_socket", &shared_handle),
+            Span::call_site(),
+        );
+
+        let source_ident = syn::Ident::new(
+            &format!("__hydro_deploy_many_{}_source", &shared_handle),
+            Span::call_site(),
+        );
+
+        let sink_ident = syn::Ident::new(
+            &format!("__hydro_deploy_many_{}_sink", &shared_handle),
+            Span::call_site(),
+        );
+
+        let membership_ident = syn::Ident::new(
+            &format!("__hydro_deploy_many_{}_membership", &shared_handle),
+            Span::call_site(),
+        );
+
+        let bind_addr = format!("0.0.0.0:{}", p2_port);
+
+        extra_stmts.push(syn::parse_quote! {
+            let #socket_ident = tokio::net::TcpListener::bind(#bind_addr).await.unwrap();
+        });
+
+        let root = crate::staging_util::get_this_crate();
+
+        extra_stmts.push(syn::parse_quote! {
+            let (#source_ident, #sink_ident, #membership_ident) = #root::runtime_support::hydro_deploy_integration::multi_connection::tcp_multi_connection::<_, #codec_type>(#socket_ident);
+        });
+
+        parse_quote!(#source_ident)
     }
 
     #[instrument(level = "trace", skip_all, fields(%shared_handle))]
     fn e2o_many_sink(shared_handle: String) -> syn::Expr {
-        todo!()
+        let sink_ident = syn::Ident::new(
+            &format!("__hydro_deploy_many_{}_sink", &shared_handle),
+            Span::call_site(),
+        );
+        parse_quote!(#sink_ident)
     }
 
     #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, p2 = p2.name, %p2_port, %shared_handle))]
     fn e2o_source(
         extra_stmts: &mut Vec<syn::Stmt>,
         p1: &Self::External,
-        p1_port: &Self::Port,
+        p1_port: &<Self::External as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
         _codec_type: &syn::Type,
         shared_handle: String,
     ) -> syn::Expr {
@@ -1004,7 +1147,7 @@ impl<'a> Deploy<'a> for DockerDeploy {
             let #socket_ident = tokio::net::TcpListener::bind(#bind_addr).await.unwrap();
         });
 
-        let create_expr = deploy_containerized_external_sink_source_ident(socket_ident.clone());
+        let create_expr = deploy_containerized_external_sink_source_ident(socket_ident);
 
         extra_stmts.push(syn::parse_quote! {
             let (#sink_ident, #source_ident) = (#create_expr).split();
@@ -1016,16 +1159,32 @@ impl<'a> Deploy<'a> for DockerDeploy {
     #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, p2 = p2.name, %p2_port, ?many, ?server_hint))]
     fn e2o_connect(
         p1: &Self::External,
-        p1_port: &Self::Port,
+        p1_port: &<Self::External as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
         many: bool,
         server_hint: NetworkHint,
     ) -> Box<dyn FnOnce()> {
-        let serialized = format!(
-            "e2o_connect {}:{p1_port:?} -> {}:{p2_port:?}",
-            p1.name, p2.name
-        );
+        if server_hint != NetworkHint::Auto {
+            panic!(
+                "Docker deployment only supports NetworkHint::Auto, got {:?}",
+                server_hint
+            );
+        }
+
+        // For many connections, we need to populate connection_info so as_bincode_bidi can find it
+        if many {
+            p1.connection_info.borrow_mut().insert(
+                *p1_port,
+                (
+                    p2.docker_container_name.clone(),
+                    *p2_port,
+                    p2.network.clone(),
+                ),
+            );
+        }
+
+        let serialized = format!("e2o_connect {}:{p1_port} -> {}:{p2_port}", p1.name, p2.name);
 
         Box::new(move || {
             trace!(name: "e2o_connect thunk", %serialized);
@@ -1035,9 +1194,9 @@ impl<'a> Deploy<'a> for DockerDeploy {
     #[instrument(level = "trace", skip_all, fields(p1 = p1.name, %p1_port, p2 = p2.name, %p2_port, %shared_handle))]
     fn o2e_sink(
         p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         p2: &Self::External,
-        p2_port: &Self::Port,
+        p2_port: &<Self::External as Node>::Port,
         shared_handle: String,
     ) -> syn::Expr {
         let sink_ident = syn::Ident::new(
@@ -1049,7 +1208,7 @@ impl<'a> Deploy<'a> for DockerDeploy {
 
     #[instrument(level = "trace", skip_all, fields(%of_cluster))]
     fn cluster_ids(
-        of_cluster: usize,
+        of_cluster: LocationKey,
     ) -> impl QuotedWithContext<'a, &'a [TaglessMemberId], ()> + Clone + 'a {
         cluster_ids()
     }
@@ -1061,6 +1220,8 @@ impl<'a> Deploy<'a> for DockerDeploy {
 
     #[instrument(level = "trace", skip_all, fields(?location_id))]
     fn cluster_membership_stream(
+        _env: &mut Self::InstantiateEnv,
+        _at_location: &LocationId,
         location_id: &LocationId,
     ) -> impl QuotedWithContext<'a, Box<dyn Stream<Item = (TaglessMemberId, MembershipEvent)> + Unpin>, ()>
     {
@@ -1073,13 +1234,16 @@ const CONTAINER_ALPHABET: [char; 36] = [
     'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-#[instrument(level = "trace", skip_all, ret, fields(%name_hint, %location, %deployment_instance))]
-fn get_docker_image_name(name_hint: &str, location: usize, deployment_instance: &str) -> String {
+#[instrument(level = "trace", skip_all, ret, fields(%name_hint, %location_key, %deployment_instance))]
+fn get_docker_image_name(
+    name_hint: &str,
+    location_key: LocationKey,
+    deployment_instance: &str,
+) -> String {
     let name_hint = name_hint
         .split("::")
         .last()
         .unwrap()
-        .to_string()
         .to_ascii_lowercase()
         .replace(".", "-")
         .replace("_", "-")
@@ -1087,7 +1251,7 @@ fn get_docker_image_name(name_hint: &str, location: usize, deployment_instance: 
 
     let image_unique_tag = nanoid::nanoid!(6, &CONTAINER_ALPHABET);
 
-    format!("hy-{name_hint}-{image_unique_tag}-{deployment_instance}-{location}")
+    format!("hy-{name_hint}-{image_unique_tag}-{deployment_instance}-{location_key}")
 }
 
 #[instrument(level = "trace", skip_all, ret, fields(%image_name, ?instance))]
@@ -1095,7 +1259,7 @@ fn get_docker_container_name(image_name: &str, instance: Option<usize>) -> Strin
     if let Some(instance) = instance {
         format!("{image_name}-{instance}")
     } else {
-        image_name.to_string()
+        image_name.to_owned()
     }
 }
 /// Represents a Process running in a docker container
@@ -1108,11 +1272,11 @@ pub struct DockerDeployProcessSpec {
 }
 
 impl<'a> ProcessSpec<'a, DockerDeploy> for DockerDeployProcessSpec {
-    #[instrument(level = "trace", skip_all, fields(%id, %name_hint))]
-    fn build(self, id: usize, name_hint: &'_ str) -> <DockerDeploy as Deploy<'a>>::Process {
+    #[instrument(level = "trace", skip_all, fields(%key, %name_hint))]
+    fn build(self, key: LocationKey, name_hint: &'_ str) -> <DockerDeploy as Deploy<'a>>::Process {
         DockerDeployProcess {
-            id,
-            name: get_docker_image_name(name_hint, id, &self.deployment_instance),
+            key,
+            name: get_docker_image_name(name_hint, key, &self.deployment_instance),
 
             next_port: Rc::new(RefCell::new(1000)),
             rust_crate: Rc::new(RefCell::new(None)),
@@ -1139,11 +1303,11 @@ pub struct DockerDeployClusterSpec {
 }
 
 impl<'a> ClusterSpec<'a, DockerDeploy> for DockerDeployClusterSpec {
-    #[instrument(level = "trace", skip_all, fields(%id, %name_hint))]
-    fn build(self, id: usize, name_hint: &str) -> <DockerDeploy as Deploy<'a>>::Cluster {
+    #[instrument(level = "trace", skip_all, fields(%key, %name_hint))]
+    fn build(self, key: LocationKey, name_hint: &str) -> <DockerDeploy as Deploy<'a>>::Cluster {
         DockerDeployCluster {
-            id,
-            name: get_docker_image_name(name_hint, id, &self.deployment_instance),
+            key,
+            name: get_docker_image_name(name_hint, key, &self.deployment_instance),
 
             next_port: Rc::new(RefCell::new(1000)),
             rust_crate: Rc::new(RefCell::new(None)),
@@ -1164,8 +1328,8 @@ pub struct DockerDeployExternalSpec {
 }
 
 impl<'a> ExternalSpec<'a, DockerDeploy> for DockerDeployExternalSpec {
-    #[instrument(level = "trace", skip_all, fields(%id, %name_hint))]
-    fn build(self, id: usize, name_hint: &str) -> <DockerDeploy as Deploy<'a>>::External {
+    #[instrument(level = "trace", skip_all, fields(%key, %name_hint))]
+    fn build(self, key: LocationKey, name_hint: &str) -> <DockerDeploy as Deploy<'a>>::External {
         DockerDeployExternal {
             name: self.name,
             next_port: Rc::new(RefCell::new(10000)),

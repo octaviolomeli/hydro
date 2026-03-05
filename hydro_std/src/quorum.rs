@@ -31,7 +31,7 @@ pub fn collect_quorum_with_response<
 
         let current_responses = not_all.chain(new_inputs);
 
-        let count_per_key = current_responses.clone().into_keyed().fold_commutative(
+        let count_per_key = current_responses.clone().into_keyed().fold(
             q!(move || (0, 0)),
             q!(move |accum, value| {
                 if value.is_ok() {
@@ -39,7 +39,7 @@ pub fn collect_quorum_with_response<
                 } else {
                     accum.1 += 1;
                 }
-            }),
+            }, commutative = manual_proof!(/** increment counters is commutative */)),
         );
 
          let not_reached_min_count = count_per_key
@@ -113,7 +113,7 @@ pub fn collect_quorum<
 
         let current_responses = not_all.chain(new_inputs);
 
-        let count_per_key = current_responses.clone().into_keyed().fold_commutative(
+        let count_per_key = current_responses.clone().into_keyed().fold(
             q!(move || (0, 0)),
             q!(move |accum, value| {
                 if value.is_ok() {
@@ -121,7 +121,7 @@ pub fn collect_quorum<
                 } else {
                     accum.1 += 1;
                 }
-            }),
+            }, commutative = manual_proof!(/** increment counters is commutative */)),
         );
 
         let reached_min_count = count_per_key
@@ -134,7 +134,7 @@ pub fn collect_quorum<
             }));
 
         let just_reached_quorum = if max == min {
-            not_all = current_responses.clone().anti_join(reached_min_count.clone());
+            not_all = current_responses.anti_join(reached_min_count.clone());
 
             reached_min_count
         } else {
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn collect_quorum_with_response_preserves_order() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (in_send, input) = node.sim_input();
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn collect_quorum_with_response_no_order() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (in_send, input) = node.sim_input::<_, NoOrder, _>();
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn collect_quorum_functionality() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (in_send, input) = node.sim_input();
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn collect_quorum_min_equals_max() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (in_send, input) = node.sim_input();
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn collect_quorum_single_response() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (in_send, input) = node.sim_input();
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn collect_quorum_no_responses() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (_in_send, input) = node.sim_input::<_, TotalOrder, _>();
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn collect_quorum_no_double_quorum_before_max() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
 
         let (in_send, input) = node.sim_input::<_, TotalOrder, _>();

@@ -9,6 +9,7 @@ use crate::compile::ir::{
     CollectionKind, DebugExpr, DfirBuilder, HydroIrOpMetadata, StreamOrder, StreamRetry,
 };
 use crate::location::dynamic::LocationId;
+use crate::staging_util::get_this_crate;
 
 /// A builder for DFIR graphs used in simulations.
 ///
@@ -143,21 +144,23 @@ impl DfirBuilder for SimBuilder {
             };
 
             let (batch_location, line, caret) = location_for_op(op_meta);
+            let root = get_this_crate();
 
             match in_kind {
                 CollectionKind::Stream {
                     order,
                     retry: StreamRetry::ExactlyOnce,
+                    element_type,
                     ..
                 } => {
                     debug_assert!(in_location.is_top_level());
 
                     let order_ty: syn::Type = match order {
                         StreamOrder::TotalOrder => {
-                            parse_quote! { hydro_lang::live_collections::stream::TotalOrder }
+                            parse_quote! { #root::live_collections::stream::TotalOrder }
                         }
                         StreamOrder::NoOrder => {
-                            parse_quote! { hydro_lang::live_collections::stream::NoOrder }
+                            parse_quote! { #root::live_collections::stream::NoOrder }
                         }
                     };
 
@@ -181,12 +184,12 @@ impl DfirBuilder for SimBuilder {
                         in_location,
                         out_location,
                         syn::parse_quote!(
-                            Box::new(hydro_lang::sim::runtime::StreamHook::<_, #order_ty> {
+                            Box::new(#root::sim::runtime::StreamHook::<_, #order_ty> {
                                 input: #buffered_ident.clone(),
                                 to_release: None,
                                 output: #hoff_send_ident,
                                 batch_location: (#batch_location, #line, #caret),
-                                format_item_debug: ::hydro_lang::__maybe_debug__!(),
+                                format_item_debug: #root::__maybe_debug__!(#element_type),
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -211,16 +214,18 @@ impl DfirBuilder for SimBuilder {
                 CollectionKind::KeyedStream {
                     value_order,
                     value_retry: StreamRetry::ExactlyOnce,
+                    key_type,
+                    value_type,
                     ..
                 } => {
                     debug_assert!(in_location.is_top_level());
 
                     let order_ty: syn::Type = match value_order {
                         StreamOrder::TotalOrder => {
-                            parse_quote! { hydro_lang::live_collections::stream::TotalOrder }
+                            parse_quote! { #root::live_collections::stream::TotalOrder }
                         }
                         StreamOrder::NoOrder => {
-                            parse_quote! { hydro_lang::live_collections::stream::NoOrder }
+                            parse_quote! { #root::live_collections::stream::NoOrder }
                         }
                     };
 
@@ -244,12 +249,12 @@ impl DfirBuilder for SimBuilder {
                         in_location,
                         out_location,
                         syn::parse_quote!(
-                            Box::new(hydro_lang::sim::runtime::KeyedStreamHook::<_, _, #order_ty> {
+                            Box::new(#root::sim::runtime::KeyedStreamHook::<_, _, #order_ty> {
                                 input: #buffered_ident.clone(),
                                 to_release: None,
                                 output: #hoff_send_ident,
                                 batch_location: (#batch_location, #line, #caret),
-                                format_item_debug: ::hydro_lang::__maybe_debug__!(),
+                                format_item_debug: #root::__maybe_debug__!((#key_type, #value_type)),
                                 _order: std::marker::PhantomData,
                             })
                         ),
@@ -271,7 +276,7 @@ impl DfirBuilder for SimBuilder {
                         None,
                     );
                 }
-                CollectionKind::Singleton { .. } => {
+                CollectionKind::Singleton { element_type, .. } => {
                     debug_assert!(in_location.is_top_level());
 
                     let hoff_id = self.next_hoff_id;
@@ -294,11 +299,11 @@ impl DfirBuilder for SimBuilder {
                         in_location,
                         out_location,
                         syn::parse_quote! (
-                            Box::new(hydro_lang::sim::runtime::SingletonHook::<_>::new(
+                            Box::new(#root::sim::runtime::SingletonHook::<_>::new(
                                 #buffered_ident.clone(),
                                 #hoff_send_ident,
                                 (#batch_location, #line, #caret),
-                                ::hydro_lang::__maybe_debug__!(),
+                                #root::__maybe_debug__!(#element_type),
                             ))
                         ),
                     );
@@ -319,7 +324,11 @@ impl DfirBuilder for SimBuilder {
                         None,
                     );
                 }
-                CollectionKind::KeyedSingleton { .. } => {
+                CollectionKind::KeyedSingleton {
+                    key_type,
+                    value_type,
+                    ..
+                } => {
                     debug_assert!(in_location.is_top_level());
 
                     let hoff_id = self.next_hoff_id;
@@ -342,12 +351,12 @@ impl DfirBuilder for SimBuilder {
                         in_location,
                         out_location,
                         syn::parse_quote! (
-                            Box::new(hydro_lang::sim::runtime::KeyedSingletonHook::<_, _>::new(
+                            Box::new(#root::sim::runtime::KeyedSingletonHook::<_, _>::new(
                                 #buffered_ident.clone(),
                                 #hoff_send_ident,
                                 (#batch_location, #line, #caret),
-                                ::hydro_lang::__maybe_debug__!(),
-                                ::hydro_lang::__maybe_debug__!(),
+                                #root::__maybe_debug__!(#key_type),
+                                #root::__maybe_debug__!(#value_type),
                             ))
                         ),
                     );
@@ -369,7 +378,7 @@ impl DfirBuilder for SimBuilder {
                     );
                 }
                 _ => {
-                    eprintln!("{:?}", op_meta.backtrace.elements());
+                    eprintln!("{:?}", op_meta.backtrace.elements().collect::<Vec<_>>());
                     todo!("batch not implemented for kind {:?}", in_kind)
                 }
             }
@@ -507,13 +516,31 @@ impl DfirBuilder for SimBuilder {
                 None,
                 None,
             );
-        } else if !location.is_top_level() {
+        } else if !location.is_root() || in_kind.is_bounded() {
+            // situations where all pending elements should be processed at once
+            if location.is_root() && in_kind.is_bounded() {
+                todo!(
+                    "observe_nondet with top-level bounded input not yet supported for kinds {:?} -> {:?}",
+                    in_kind,
+                    out_kind
+                )
+            }
+
             let (assume_location, line, caret) = location_for_op(op_meta);
+            let root = get_this_crate();
+
+            let location = if let LocationId::Atomic(tick) = location {
+                tick.as_ref()
+            } else {
+                location
+            };
+
             match (in_kind, out_kind) {
                 (
                     CollectionKind::Stream {
                         order: StreamOrder::NoOrder,
                         retry: StreamRetry::ExactlyOnce,
+                        element_type,
                         ..
                     },
                     CollectionKind::Stream {
@@ -547,11 +574,11 @@ impl DfirBuilder for SimBuilder {
                     self.add_inline_hook(
                         location,
                         syn::parse_quote!(
-                            Box::new(hydro_lang::sim::runtime::StreamOrderHook::<_>::new(
+                            Box::new(#root::sim::runtime::StreamOrderHook::<_>::new(
                                 #buffered_ident.clone(),
                                 #hoff_send_ident,
                                 (#assume_location, #line, #caret),
-                                ::hydro_lang::__maybe_debug__!(),
+                                #root::__maybe_debug__!(#element_type),
                             ))
                         ),
                     );
@@ -586,6 +613,8 @@ impl DfirBuilder for SimBuilder {
                     CollectionKind::KeyedStream {
                         value_order: StreamOrder::NoOrder,
                         value_retry: StreamRetry::ExactlyOnce,
+                        key_type,
+                        value_type,
                         ..
                     },
                     CollectionKind::KeyedStream {
@@ -619,12 +648,12 @@ impl DfirBuilder for SimBuilder {
                     self.add_inline_hook(
                         location,
                         syn::parse_quote!(
-                            Box::new(hydro_lang::sim::runtime::KeyedStreamOrderHook::<_, _>::new(
+                            Box::new(#root::sim::runtime::KeyedStreamOrderHook::<_, _>::new(
                                 #buffered_ident.clone(),
                                 #hoff_send_ident,
                                 (#assume_location, #line, #caret),
-                                ::hydro_lang::__maybe_debug__!(),
-                                ::hydro_lang::__maybe_debug__!(),
+                                #root::__maybe_debug__!(#key_type),
+                                #root::__maybe_debug__!(#value_type),
                             ))
                         ),
                     );
@@ -664,7 +693,137 @@ impl DfirBuilder for SimBuilder {
                 }
             }
         } else {
-            todo!("non-trusted observe_nondet not yet supported at top-level locations");
+            let (assume_location, line, caret) = location_for_op(op_meta);
+            let root = get_this_crate();
+
+            match (in_kind, out_kind) {
+                (
+                    CollectionKind::Stream {
+                        order: StreamOrder::NoOrder,
+                        retry: StreamRetry::ExactlyOnce,
+                        element_type,
+                        ..
+                    },
+                    CollectionKind::Stream {
+                        order: StreamOrder::TotalOrder,
+                        retry: StreamRetry::ExactlyOnce,
+                        ..
+                    },
+                ) => {
+                    let hoff_id = self.next_hoff_id;
+                    self.next_hoff_id += 1;
+
+                    let buffered_ident =
+                        syn::Ident::new(&format!("__buffered_{hoff_id}"), Span::call_site());
+                    let hoff_send_ident =
+                        syn::Ident::new(&format!("__hoff_send_{hoff_id}"), Span::call_site());
+                    let hoff_recv_ident =
+                        syn::Ident::new(&format!("__hoff_recv_{hoff_id}"), Span::call_site());
+
+                    self.add_extra_stmt_internal(location, syn::parse_quote! {
+                        let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
+                    });
+                    self.add_extra_stmt_internal(location, syn::parse_quote! {
+                        let #buffered_ident = ::std::rc::Rc::new(::std::cell::RefCell::new(::std::collections::VecDeque::new()));
+                    });
+                    self.add_hook(
+                        location,
+                        location,
+                        syn::parse_quote!(
+                            Box::new(#root::sim::runtime::TopLevelStreamOrderHook::<_> {
+                                input: #buffered_ident.clone(),
+                                to_release: None,
+                                output: #hoff_send_ident,
+                                location: (#assume_location, #line, #caret),
+                                format_item_debug: #root::__maybe_debug__!(#element_type),
+                            })
+                        ),
+                    );
+
+                    self.get_dfir_mut(location).add_dfir(
+                        parse_quote! {
+                            #in_ident -> for_each(|v| #buffered_ident.borrow_mut().push_back(v));
+                        },
+                        None,
+                        None,
+                    );
+
+                    self.get_dfir_mut(location).add_dfir(
+                        parse_quote! {
+                            #out_ident = source_stream(#hoff_recv_ident);
+                        },
+                        None,
+                        None,
+                    );
+                }
+                (
+                    CollectionKind::KeyedStream {
+                        value_order: StreamOrder::NoOrder,
+                        value_retry: StreamRetry::ExactlyOnce,
+                        key_type,
+                        value_type,
+                        ..
+                    },
+                    CollectionKind::KeyedStream {
+                        value_order: StreamOrder::TotalOrder,
+                        value_retry: StreamRetry::ExactlyOnce,
+                        ..
+                    },
+                ) => {
+                    let hoff_id = self.next_hoff_id;
+                    self.next_hoff_id += 1;
+
+                    let buffered_ident =
+                        syn::Ident::new(&format!("__buffered_{hoff_id}"), Span::call_site());
+                    let hoff_send_ident =
+                        syn::Ident::new(&format!("__hoff_send_{hoff_id}"), Span::call_site());
+                    let hoff_recv_ident =
+                        syn::Ident::new(&format!("__hoff_recv_{hoff_id}"), Span::call_site());
+
+                    self.add_extra_stmt_internal(location, syn::parse_quote! {
+                        let (#hoff_send_ident, #hoff_recv_ident) = __root_dfir_rs::util::unbounded_channel();
+                    });
+                    self.add_extra_stmt_internal(location, syn::parse_quote! {
+                        let #buffered_ident = ::std::rc::Rc::new(::std::cell::RefCell::new(__root_dfir_rs::rustc_hash::FxHashMap::default()));
+                    });
+                    self.add_hook(
+                        location,
+                        location,
+                        syn::parse_quote!(
+                            Box::new(#root::sim::runtime::TopLevelKeyedStreamOrderHook::<_, _> {
+                                input: #buffered_ident.clone(),
+                                to_release: None,
+                                output: #hoff_send_ident,
+                                location: (#assume_location, #line, #caret),
+                                format_item_debug: #root::__maybe_debug__!((#key_type, #value_type)),
+                            })
+                        ),
+                    );
+
+                    self.get_dfir_mut(location).add_dfir(
+                        parse_quote! {
+                            #in_ident -> for_each(|(k, v)| #buffered_ident.borrow_mut().entry(k).or_insert_with(::std::collections::VecDeque::new).push_back(v));
+                        },
+                        None,
+                        None,
+                    );
+
+                    self.get_dfir_mut(location).add_dfir(
+                        parse_quote! {
+                            #out_ident = source_stream(#hoff_recv_ident);
+                        },
+                        None,
+                        None,
+                    );
+                }
+                _ => {
+                    todo!(
+                        "non-trusted observe_nondet not yet supported for kinds {:?} -> {:?} at top-level locations",
+                        in_kind,
+                        out_kind
+                    );
+                }
+            }
         }
     }
 
@@ -674,12 +833,23 @@ impl DfirBuilder for SimBuilder {
         to: &LocationId,
         input_ident: syn::Ident,
         out_ident: &syn::Ident,
-        serialize: &Option<DebugExpr>,
+        serialize: Option<&DebugExpr>,
         sink: syn::Expr,
         source: syn::Expr,
-        deserialize: &Option<DebugExpr>,
+        deserialize: Option<&DebugExpr>,
         tag_id: usize,
+        networking_info: &crate::networking::NetworkingInfo,
     ) {
+        use crate::networking::{NetworkingInfo, TcpFault};
+        match networking_info {
+            NetworkingInfo::Tcp { fault } => match fault {
+                TcpFault::FailStop => {}
+                _ => todo!("SimBuilder only supports fail-stop TCP networking"),
+            },
+        }
+
+        let root = get_this_crate();
+
         match (from, to) {
             (LocationId::Process(_), LocationId::Process(_)) => {
                 self.extra_stmts_global.push(syn::parse_quote! {
@@ -724,7 +894,7 @@ impl DfirBuilder for SimBuilder {
             }
             (LocationId::Cluster(_), LocationId::Process(_)) => {
                 self.extra_stmts_global.push(syn::parse_quote! {
-                    let (#sink, #source) = __root_dfir_rs::util::unbounded_channel::<(::hydro_lang::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>();
+                    let (#sink, #source) = __root_dfir_rs::util::unbounded_channel::<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>();
                 });
 
                 self.extra_stmts_cluster
@@ -737,7 +907,7 @@ impl DfirBuilder for SimBuilder {
                 if let Some(serialize_pipeline) = serialize {
                     self.get_dfir_mut(from).add_dfir(
                         parse_quote! {
-                            #input_ident -> map(#serialize_pipeline) -> for_each(|v| #sink.send((::hydro_lang::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            #input_ident -> map(#serialize_pipeline) -> for_each(|v| #sink.send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
                         },
                         None,
                         Some(&format!("send{}", tag_id)),
@@ -745,7 +915,7 @@ impl DfirBuilder for SimBuilder {
                 } else {
                     self.get_dfir_mut(from).add_dfir(
                         parse_quote! {
-                            #input_ident -> for_each(|v| #sink.send((::hydro_lang::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            #input_ident -> for_each(|v| #sink.send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
                         },
                         None,
                         Some(&format!("send{}", tag_id)),
@@ -797,7 +967,7 @@ impl DfirBuilder for SimBuilder {
                 if let Some(serialize_pipeline) = serialize {
                     self.get_dfir_mut(from).add_dfir(
                         parse_quote! {
-                            #input_ident -> map(#serialize_pipeline) -> for_each(|(target_member_id, v)| (#sink.borrow())[::hydro_lang::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send(v).unwrap());
+                            #input_ident -> map(#serialize_pipeline) -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send(v).unwrap());
                         },
                         None,
                         Some(&format!("send{}", tag_id)),
@@ -805,7 +975,7 @@ impl DfirBuilder for SimBuilder {
                 } else {
                     self.get_dfir_mut(from).add_dfir(
                         parse_quote! {
-                            #input_ident -> for_each(|(target_member_id, v)| (#sink.borrow())[::hydro_lang::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send(v).unwrap());
+                            #input_ident -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send(v).unwrap());
                         },
                         None,
                         Some(&format!("send{}", tag_id)),
@@ -836,7 +1006,7 @@ impl DfirBuilder for SimBuilder {
                     Span::call_site(),
                 );
                 self.extra_stmts_global.push(syn::parse_quote! {
-                    let #sink: ::std::rc::Rc<::std::cell::RefCell<Vec<__root_dfir_rs::tokio::sync::mpsc::UnboundedSender<(::hydro_lang::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>>>> = ::std::rc::Rc::new(::std::cell::RefCell::new(Vec::new()));
+                    let #sink: ::std::rc::Rc<::std::cell::RefCell<Vec<__root_dfir_rs::tokio::sync::mpsc::UnboundedSender<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>>>> = ::std::rc::Rc::new(::std::cell::RefCell::new(Vec::new()));
                 });
 
                 self.extra_stmts_global.push(syn::parse_quote! {
@@ -855,7 +1025,7 @@ impl DfirBuilder for SimBuilder {
                     .or_default()
                     .push(syn::parse_quote! {
                         let #source = {
-                            let (__sink, __source) = __root_dfir_rs::util::unbounded_channel::<(::hydro_lang::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>();
+                            let (__sink, __source) = __root_dfir_rs::util::unbounded_channel::<(#root::__staged::location::TaglessMemberId, __root_dfir_rs::bytes::Bytes)>();
                             #sink_writer.borrow_mut().push(__sink);
                             __source
                         };
@@ -864,7 +1034,7 @@ impl DfirBuilder for SimBuilder {
                 if let Some(serialize_pipeline) = serialize {
                     self.get_dfir_mut(from).add_dfir(
                         parse_quote! {
-                            #input_ident -> map(#serialize_pipeline) -> for_each(|(target_member_id, v)| (#sink.borrow())[::hydro_lang::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send((::hydro_lang::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            #input_ident -> map(#serialize_pipeline) -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
                         },
                         None,
                         Some(&format!("send{}", tag_id)),
@@ -872,7 +1042,7 @@ impl DfirBuilder for SimBuilder {
                 } else {
                     self.get_dfir_mut(from).add_dfir(
                         parse_quote! {
-                            #input_ident -> for_each(|(target_member_id, v)| (#sink.borrow())[::hydro_lang::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send((::hydro_lang::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
+                            #input_ident -> for_each(|(target_member_id, v)| (#sink.borrow())[#root::__staged::location::TaglessMemberId::get_raw_id(&target_member_id) as usize].send((#root::__staged::location::TaglessMemberId::from_raw_id(__current_cluster_id), v)).unwrap());
                         },
                         None,
                         Some(&format!("send{}", tag_id)),
@@ -911,7 +1081,7 @@ impl DfirBuilder for SimBuilder {
         on: &LocationId,
         source_expr: syn::Expr,
         out_ident: &syn::Ident,
-        deserialize: &Option<DebugExpr>,
+        deserialize: Option<&DebugExpr>,
         tag_id: usize,
     ) {
         if let Some(deserialize_pipeline) = deserialize {
@@ -938,7 +1108,7 @@ impl DfirBuilder for SimBuilder {
         on: &LocationId,
         sink_expr: syn::Expr,
         input_ident: &syn::Ident,
-        serialize: &Option<DebugExpr>,
+        serialize: Option<&DebugExpr>,
         tag_id: usize,
     ) {
         let grabbed_ident = syn::Ident::new(&format!("__sink_{tag_id}"), Span::call_site());
@@ -974,7 +1144,7 @@ fn location_for_op(op_meta: &HydroIrOpMetadata) -> (String, String, String) {
     op_meta
         .backtrace
         .elements()
-        .first()
+        .next()
         .and_then(|e| {
             let filename = e.filename.as_deref()?;
             let lineno = e.lineno?;
@@ -985,7 +1155,7 @@ fn location_for_op(op_meta: &HydroIrOpMetadata) -> (String, String, String) {
                 .and_then(|s| {
                     s.lines()
                         .nth(lineno.saturating_sub(1).try_into().unwrap())
-                        .map(|s| s.to_string())
+                        .map(|s| s.to_owned())
                 })
                 .unwrap_or_default();
 
@@ -997,7 +1167,7 @@ fn location_for_op(op_meta: &HydroIrOpMetadata) -> (String, String, String) {
 
             let filename_display = relative_path
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| filename.to_string());
+                .unwrap_or_else(|| filename.to_owned());
 
             Some((
                 format!("{}:{}:{}", filename_display, lineno, colno),
@@ -1005,11 +1175,5 @@ fn location_for_op(op_meta: &HydroIrOpMetadata) -> (String, String, String) {
                 format!("{:>1$}", "", (colno - 1).try_into().unwrap()),
             ))
         })
-        .unwrap_or_else(|| {
-            (
-                "unknown location".to_string(),
-                "".to_string(),
-                "".to_string(),
-            )
-        })
+        .unwrap_or_else(|| ("unknown location".to_owned(), "".to_owned(), "".to_owned()))
 }

@@ -14,7 +14,7 @@ fn backtrace_chained_ops() {
     use crate::location::Location;
     use crate::prelude::FlowBuilder;
 
-    let flow = FlowBuilder::new();
+    let mut flow = FlowBuilder::new();
     let node = flow.process::<()>();
 
     node.source_iter(q!([123])).for_each(q!(|_| {}));
@@ -34,6 +34,8 @@ fn backtrace_chained_ops() {
     };
     let for_each_meta = finalized.ir()[0].op_metadata();
 
-    hydro_build_utils::assert_debug_snapshot!(source_meta.backtrace.elements());
-    hydro_build_utils::assert_debug_snapshot!(for_each_meta.backtrace.elements());
+    hydro_build_utils::assert_debug_snapshot!(source_meta.backtrace.elements().collect::<Vec<_>>());
+    hydro_build_utils::assert_debug_snapshot!(
+        for_each_meta.backtrace.elements().collect::<Vec<_>>()
+    );
 }

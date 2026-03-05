@@ -20,11 +20,11 @@ The simplest way to create a stream is to use [`Location::source_iter`](https://
 # use futures::StreamExt;
 # tokio_test::block_on(hydro_lang::test_util::multi_location_test(|flow, p_out| {
 let process = flow.process::<()>();
-let numbers: Stream<_, Process<_>, Unbounded> = process
+let numbers: Stream<_, Process<_>, Bounded> = process
     .source_iter(q!(vec![1, 2, 3]))
     .map(q!(|x| x + 1));
 // 2, 3, 4
-# numbers.send_bincode(&p_out)
+# numbers.send(&p_out, TCP.fail_stop().bincode())
 # }, |mut stream| async move {
 # for w in 2..=4 {
 #     assert_eq!(stream.next().await, Some(w));
@@ -39,11 +39,11 @@ Streams also can be sent over the network to participate in distributed programs
 # use futures::StreamExt;
 # tokio_test::block_on(hydro_lang::test_util::multi_location_test(|flow, p_out| {
 let p1 = flow.process::<()>();
-let numbers: Stream<_, Process<_>, Unbounded> = p1.source_iter(q!(vec![1, 2, 3]));
+let numbers: Stream<_, Process<_>, Bounded> = p1.source_iter(q!(vec![1, 2, 3]));
 let p2 = flow.process::<()>();
-let on_p2: Stream<_, Process<_>, Unbounded> = numbers.send_bincode(&p2);
+let on_p2: Stream<_, Process<_>, Unbounded> = numbers.send(&p2, TCP.fail_stop().bincode());
 // 1, 2, 3
-# on_p2.send_bincode(&p_out)
+# on_p2.send(&p_out, TCP.fail_stop().bincode())
 # }, |mut stream| async move {
 # for w in 1..=3 {
 #     assert_eq!(stream.next().await, Some(w));
@@ -60,14 +60,14 @@ If we send a stream from a cluster to a process and flatten the values across se
 
 ```rust,no_run
 # use hydro_lang::prelude::*;
-# let flow = FlowBuilder::new();
+# let mut flow = FlowBuilder::new();
 use hydro_lang::live_collections::stream::{NoOrder, TotalOrder};
 let workers: Cluster<()> = flow.cluster::<()>();
-let numbers: Stream<_, Cluster<_>, Unbounded, TotalOrder> =
+let numbers: Stream<_, Cluster<_>, Bounded, TotalOrder> =
     workers.source_iter(q!(vec![1, 2, 3]));
 let process: Process<()> = flow.process::<()>();
 let on_p2: Stream<_, Process<_>, Unbounded, NoOrder> =
-    numbers.send_bincode(&process).values();
+    numbers.send(&process, TCP.fail_stop().bincode()).values();
 ```
 
 The ordering of a stream determines which APIs are available on it. For example, `map` and `filter` are available on all streams, but `last` is only available on streams with `TotalOrder`. This ensures that even when the network introduces non-determinism, the program will not compile if it tries to use an API that requires a deterministic order.
@@ -76,48 +76,80 @@ A particularly common API that faces this restriction is [`fold`](pathname:///ru
 
 ```compile_fail
 # use hydro_lang::prelude::*;
-# let flow = FlowBuilder::new();
+# let mut flow = FlowBuilder::new();
 let workers: Cluster<()> = flow.cluster::<()>();
 let process: Process<()> = flow.process::<()>();
 let all_words: Stream<_, Process<_>, Unbounded, NoOrder> = workers
     .source_iter(q!(vec!["hello", "world"]))
     .map(q!(|x| x.to_string()))
-    .send_bincode(&process)
+    .send(&process, TCP.fail_stop().bincode())
     .values();
 
 let words_concat = all_words
-    .fold(q!(|| "".to_string()), q!(|acc, x| acc += x));
+    .fold(q!(String::new), q!(|acc, x| acc += x));
 //   ^^^^ error: `hydro_lang::Stream<String, hydro_lang::Process<'_>, hydro_lang::Unbounded, NoOrder>` is not an iterator
 ```
 
 :::tip
 
-We use `values()` here to drop the member IDs which are included in `send_bincode`. See [Clusters](../locations/clusters.md) for more details.
+We use `values()` here to drop the member IDs which are included in `send`. See [Clusters](../locations/clusters.md) for more details.
 
 Running an aggregation (`fold`, `reduce`) converts a `Stream` into a `Singleton`, as we see in the type signature here. The `Singleton` type is still "live" in the sense of a [Live Collection](./index.md), so updates to the `Stream` input cause updates to the `Singleton` output. See [Singletons and Optionals](./singletons-optionals.md) for more information.
 
 :::
 
-To perform an aggregation with an unordered stream, you must use [`fold_commutative`](pathname:///rustdoc/hydro_lang/live_collections/struct.Stream#method.fold_commutative), which requires the provided closure to be commutative (and therefore immune to non-deterministic ordering):
+To perform an aggregation with an unordered stream, you must add a **property annotation**, which demonstrates that the provided closure is commutative (and therefore immune to non-deterministic ordering):
 
 ```rust,no_run
 # use hydro_lang::prelude::*;
 # use futures::StreamExt;
-# let flow = FlowBuilder::new();
+# let mut flow = FlowBuilder::new();
 # let workers = flow.cluster::<()>();
 # let process = flow.process::<()>();
 # let all_words: Stream<_, Process<_>, _, hydro_lang::live_collections::stream::NoOrder> = workers
 #     .source_iter(q!(vec!["hello", "world"]))
 #     .map(q!(|x| x.to_string()))
-#     .send_bincode(&process)
+#     .send(&process, TCP.fail_stop().bincode())
 #     .values();
 let words_count = all_words
-    .fold_commutative(q!(|| 0), q!(|acc, x| *acc += 1));
+    .fold(q!(|| 0), q!(|acc, _| *acc += 1, commutative = manual_proof!(/** increment is commutative */)));
 ```
 
 :::danger
 
-Developers are responsible for the commutativity of the closure they pass into `*_commutative` methods. In the future, commutativity checks will be automatically provided by the compiler (via tools like [Kani](https://github.com/model-checking/kani)).
+Developers are responsible for the commutativity when they use a `ManualProof`. In the future, commutativity checks will be automatically provided by the compiler (via tools like [Kani](https://github.com/model-checking/kani)).
+
+:::
+
+### Observing Non-Deterministic Order
+Sometimes you may want to intentionally observe the non-deterministic order of a stream, accepting that the result may vary across runs. For example, you might want to take the first element that arrives from any cluster member, regardless of which one it is.
+
+To do this, you can use [`assume_ordering`](pathname:///rustdoc/hydro_lang/live_collections/struct.Stream#method.assume_ordering) to cast a `NoOrder` stream to `TotalOrder`. This requires a `nondet!` guard, which forces you to document _why_ the non-determinism is acceptable:
+
+```rust,no_run
+# use hydro_lang::prelude::*;
+# let mut flow = FlowBuilder::new();
+use hydro_lang::live_collections::stream::{NoOrder, TotalOrder};
+let workers: Cluster<()> = flow.cluster::<()>();
+let process: Process<()> = flow.process::<()>();
+let unordered: Stream<_, Process<_>, Unbounded, NoOrder> = workers
+    .source_iter(q!(vec![1, 2, 3]))
+    .send(&process, TCP.fail_stop().bincode())
+    .values();
+
+let first_arrival = unordered
+    .assume_ordering::<TotalOrder>(nondet!(
+        /// We only care about the first value to arrive, regardless of which
+        /// cluster member sent it.
+    ))
+    .first();
+```
+
+The `nondet!` macro takes a doc comment explaining why the non-determinism is tolerable. This serves as inline documentation for anyone reading the code later, making it clear that the non-determinism is a deliberate choice rather than an oversight.
+
+:::caution
+
+Use `assume_ordering` sparingly. Once you cast a stream to `TotalOrder`, the type system can no longer protect you from order-dependent bugs. When writing code that involves such non-deterministic APIs, you should use the [Hydro simulator](../simulation/index.mdx) to test potential edge cases. When it encounters an `assume_ordering`, the simulator will test all possible element orders that could appear in the output.
 
 :::
 

@@ -18,6 +18,9 @@ pub struct BuildParams {
     /// The working directory for the build, where the `cargo build` command will be run. Crate root.
     /// [`Self::new`] canonicalizes this path.
     src: PathBuf,
+    /// The workspace root encompassing the build, which may be a parent of `src` in a multi-crate
+    /// workspace.
+    workspace_root: PathBuf,
     /// `--bin` binary name parameter.
     bin: Option<String>,
     /// `--example` parameter.
@@ -31,6 +34,8 @@ pub struct BuildParams {
     no_default_features: bool,
     /// `--target <linux>` if cross-compiling for linux ([`HostTargetType::Linux`]).
     target_type: HostTargetType,
+    /// True is the build should use dynamic linking.
+    is_dylib: bool,
     /// `--features` flags, will be comma-delimited.
     features: Option<Vec<String>>,
     /// `--config` flag
@@ -41,6 +46,7 @@ impl BuildParams {
     #[expect(clippy::too_many_arguments, reason = "internal code")]
     pub fn new(
         src: impl AsRef<Path>,
+        workspace_root: impl AsRef<Path>,
         bin: Option<String>,
         example: Option<String>,
         profile: Option<String>,
@@ -49,6 +55,7 @@ impl BuildParams {
         build_env: Vec<(String, String)>,
         no_default_features: bool,
         target_type: HostTargetType,
+        is_dylib: bool,
         features: Option<Vec<String>>,
         config: Vec<String>,
     ) -> Self {
@@ -58,10 +65,23 @@ impl BuildParams {
         // Rust codegen pattern on windows. To help mitigate this happening in third party crates, we
         // instead use `dunce::canonicalize` which is the same as `fs::canonicalize` but avoids the
         // `\\?\` prefix when possible.
-        let src = dunce::canonicalize(src).expect("Failed to canonicalize path for build.");
+        let src = dunce::canonicalize(src.as_ref()).unwrap_or_else(|e| {
+            panic!(
+                "Failed to canonicalize path `{}` for build: {e}.",
+                src.as_ref().display(),
+            )
+        });
+
+        let workspace_root = dunce::canonicalize(workspace_root.as_ref()).unwrap_or_else(|e| {
+            panic!(
+                "Failed to canonicalize path `{}` for build: {e}.",
+                workspace_root.as_ref().display(),
+            )
+        });
 
         BuildParams {
             src,
+            workspace_root,
             bin,
             example,
             profile,
@@ -70,6 +90,7 @@ impl BuildParams {
             build_env,
             no_default_features,
             target_type,
+            is_dylib,
             features,
             config,
         }
@@ -145,22 +166,9 @@ pub async fn build_crate_memoized(params: BuildParams) -> Result<&'static BuildO
                         command.args(["--target-dir", target_dir.to_str().unwrap()]);
                     }
 
-                    let is_dylib = if let Some(rustflags) = params.rustflags.as_ref() {
+                    if let Some(rustflags) = params.rustflags.as_ref() {
                         command.env("RUSTFLAGS", rustflags);
-                        false
-                    } else if params.target_type == HostTargetType::Local
-                        && !cfg!(target_os = "windows")
-                    {
-                        // When compiling for local, prefer dynamic linking to reduce binary size
-                        // Windows is currently not supported due to https://github.com/bevyengine/bevy/pull/2016
-                        command.env(
-                            "RUSTFLAGS",
-                            std::env::var("RUSTFLAGS").unwrap_or_default() + " -C prefer-dynamic",
-                        );
-                        true
-                    } else {
-                        false
-                    };
+                    }
 
                     for (k, v) in params.build_env {
                         command.env(k, v);
@@ -195,9 +203,9 @@ pub async fn build_crate_memoized(params: BuildParams) -> Result<&'static BuildO
                         match message.unwrap() {
                             cargo_metadata::Message::CompilerArtifact(artifact) => {
                                 let is_output = if params.example.is_some() {
-                                    artifact.target.kind.contains(&"example".to_string())
+                                    artifact.target.kind.iter().any(|k| "example" == k)
                                 } else {
-                                    artifact.target.kind.contains(&"bin".to_string())
+                                    artifact.target.kind.iter().any(|k| "bin" == k)
                                 };
 
                                 if is_output {
@@ -209,7 +217,7 @@ pub async fn build_crate_memoized(params: BuildParams) -> Result<&'static BuildO
                                     return Ok(BuildOutput {
                                         bin_data: data,
                                         bin_path: path_buf,
-                                        shared_library_path: if is_dylib {
+                                        shared_library_path: if params.is_dylib {
                                             Some(
                                                 params
                                                     .target_dir
@@ -235,13 +243,15 @@ pub async fn build_crate_memoized(params: BuildParams) -> Result<&'static BuildO
                                         .map(|s| &s.file_name)
                                         .collect::<std::collections::BTreeSet<_>>();
                                     for file_name in file_names {
-                                        *rendered = rendered.replace(
-                                            file_name,
-                                            &format!(
-                                                "(full path) {}/{file_name}",
-                                                params.src.display(),
-                                            ),
-                                        )
+                                        if Path::new(file_name).is_relative() {
+                                            *rendered = rendered.replace(
+                                                file_name,
+                                                &format!(
+                                                    "(full path) {}/{file_name}",
+                                                    params.workspace_root.display(),
+                                                ),
+                                            )
+                                        }
                                     }
                                 }
                                 ProgressTracker::println(msg.message.to_string());

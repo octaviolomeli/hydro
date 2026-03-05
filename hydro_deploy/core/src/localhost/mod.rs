@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -17,6 +18,7 @@ use crate::{
 pub mod launched_binary;
 pub use launched_binary::*;
 
+#[cfg(feature = "profile-folding")]
 #[cfg(any(target_os = "macos", target_family = "windows"))]
 mod samply;
 
@@ -128,7 +130,7 @@ impl LaunchedHost for LaunchedLocalhost {
         match bind_type {
             BaseServerStrategy::UnixSocket => ServerBindConfig::UnixSocket,
             BaseServerStrategy::InternalTcpPort(port) => {
-                ServerBindConfig::TcpPort("127.0.0.1".to_string(), *port)
+                ServerBindConfig::TcpPort("127.0.0.1".to_owned(), *port)
             }
             BaseServerStrategy::ExternalTcpPort(_) => panic!("Cannot bind to external port"),
         }
@@ -144,6 +146,7 @@ impl LaunchedHost for LaunchedLocalhost {
         binary: &BuildOutput,
         args: &[String],
         tracing: Option<TracingOptions>,
+        env: &HashMap<String, String>,
     ) -> Result<Box<dyn LaunchedBinary>> {
         let (maybe_perf_outfile, mut command) = if let Some(tracing) = tracing.as_ref() {
             if cfg!(any(target_os = "macos", target_family = "windows")) {
@@ -212,7 +215,7 @@ impl LaunchedHost for LaunchedLocalhost {
                 .arg("--print")
                 .arg("target-libdir")
                 .output()
-                .map(|output| String::from_utf8(output.stdout).unwrap().trim().to_string())
+                .map(|output| str::from_utf8(&output.stdout).unwrap().trim().to_owned())
                 .unwrap()
         });
 
@@ -240,6 +243,8 @@ impl LaunchedHost for LaunchedLocalhost {
                 },
             ),
         );
+
+        command.envs(env);
 
         command
             .stdin(Stdio::piped())

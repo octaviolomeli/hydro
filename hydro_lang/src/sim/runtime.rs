@@ -15,24 +15,46 @@ use crate::live_collections::stream::{NoOrder, Ordering, TotalOrder};
 pub type Hooks<Key> = HashMap<(Key, Option<u32>), Vec<Box<dyn SimHook>>>;
 pub type InlineHooks<Key> = HashMap<(Key, Option<u32>), Vec<Box<dyn SimInlineHook>>>;
 
+#[doc(hidden)]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __maybe_debug__ {
-    () => {{
-        trait NotDebug {
-            fn format_debug(&self) -> Option<String> {
-                None
-            }
+    ($type:ty) => {{
+        // Inherent-shadows-trait trick (same as `impls` crate), but for
+        // a function pointer. The const is stored as a raw `*const ()` to
+        // avoid mentioning the type in the const type (which would force
+        // bound resolution and break the trick). We transmute back at the end.
+
+        #[expect(clippy::allow_attributes, reason = "macro codegen")]
+        #[allow(dead_code, reason = "shadowing trick")]
+        fn no_debug<T>(_: &T) -> Option<String> {
+            None
+        }
+        fn yes_debug<T: std::fmt::Debug>(v: &T) -> Option<String> {
+            Some(format!("{:?}", v))
         }
 
-        impl<T> NotDebug for T {}
-        struct IsDebug<T>(std::marker::PhantomData<T>);
-        impl<T: std::fmt::Debug> IsDebug<T> {
-            fn format_debug(v: &T) -> Option<String> {
-                Some(format!("{:?}", v))
-            }
+        trait __Fallback {
+            const MAYBE_DEBUG_FN: *const () = no_debug::<()> as *const ();
         }
-        IsDebug::format_debug
+        impl<T: ?Sized> __Fallback for T {}
+
+        struct __Wrap<T>(std::marker::PhantomData<T>);
+
+        #[expect(clippy::allow_attributes, reason = "macro codegen")]
+        #[allow(dead_code, reason = "shadowing trick")]
+        impl<T: std::fmt::Debug> __Wrap<T> {
+            const MAYBE_DEBUG_FN: *const () = yes_debug::<T> as *const ();
+        }
+
+        // SAFETY: The pointer is either `no_debug::<()>` or `yes_debug::<$type>`.
+        // `no_debug` ignores its argument entirely, so the ABI is compatible
+        // regardless of the concrete type.
+        unsafe {
+            std::mem::transmute::<*const (), fn(&$type) -> Option<String>>(
+                <__Wrap<$type>>::MAYBE_DEBUG_FN,
+            )
+        }
     }};
 }
 
@@ -138,7 +160,7 @@ impl<T> SimHook for StreamHook<T, TotalOrder> {
         if let Some(to_release) = self.to_release.take() {
             let (batch_location, line, caret_indent) = self.batch_location;
             let note_str = if to_release.is_empty() {
-                "^ releasing no items".to_string()
+                "^ releasing no items".to_owned()
             } else {
                 format!(
                     "^ releasing items: {:?}",
@@ -222,7 +244,7 @@ impl<T> SimHook for StreamHook<T, NoOrder> {
         if let Some(to_release) = self.to_release.take() {
             let (batch_location, line, caret_indent) = self.batch_location;
             let note_str = if to_release.is_empty() {
-                "^ releasing no items".to_string()
+                "^ releasing no items".to_owned()
             } else {
                 format!(
                     "^ releasing unordered items: {:?}",
@@ -275,6 +297,7 @@ impl<K: Hash + Eq + Clone, V> SimHook for KeyedStreamHook<K, V, TotalOrder> {
     }
 
     fn can_make_nontrivial_decision(&self) -> bool {
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         !self.input.borrow().values().all(|q| q.is_empty())
     }
 
@@ -285,9 +308,11 @@ impl<K: Hash + Eq + Clone, V> SimHook for KeyedStreamHook<K, V, TotalOrder> {
     ) -> bool {
         let mut current_input = self.input.borrow_mut();
         self.to_release = Some(vec![]);
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         let nonempty_key_count = current_input.values().filter(|q| !q.is_empty()).count();
 
         let mut remaining_nonempty_keys = nonempty_key_count;
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         for (key, queue) in current_input.iter_mut() {
             if queue.is_empty() {
                 continue;
@@ -318,7 +343,7 @@ impl<K: Hash + Eq + Clone, V> SimHook for KeyedStreamHook<K, V, TotalOrder> {
         if let Some(to_release) = self.to_release.take() {
             let (batch_location, line, caret_indent) = self.batch_location;
             let note_str = if to_release.is_empty() {
-                "^ releasing no items".to_string()
+                "^ releasing no items".to_owned()
             } else {
                 format!(
                     "^ releasing items: {:?}",
@@ -362,6 +387,7 @@ impl<K: Hash + Eq + Clone, V> SimHook for KeyedStreamHook<K, V, NoOrder> {
     }
 
     fn can_make_nontrivial_decision(&self) -> bool {
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         !self.input.borrow().values().all(|q| q.is_empty())
     }
 
@@ -372,9 +398,11 @@ impl<K: Hash + Eq + Clone, V> SimHook for KeyedStreamHook<K, V, NoOrder> {
     ) -> bool {
         let mut current_input = self.input.borrow_mut();
         self.to_release = Some(vec![]);
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         let nonempty_key_count = current_input.values().filter(|q| !q.is_empty()).count();
 
         let mut remaining_nonempty_keys = nonempty_key_count;
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         for (key, queue) in current_input.iter_mut() {
             if queue.is_empty() {
                 continue;
@@ -412,7 +440,7 @@ impl<K: Hash + Eq + Clone, V> SimHook for KeyedStreamHook<K, V, NoOrder> {
         if let Some(to_release) = self.to_release.take() {
             let (batch_location, line, caret_indent) = self.batch_location;
             let note_str = if to_release.is_empty() {
-                "^ releasing no items".to_string()
+                "^ releasing no items".to_owned()
             } else {
                 format!(
                     "^ releasing unordered items: {:?}",
@@ -615,6 +643,7 @@ impl<K: Hash + Eq + Clone, V: Clone> SimHook for KeyedSingletonHook<K, V> {
     }
 
     fn can_make_nontrivial_decision(&self) -> bool {
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         !self.input.borrow().values().all(|q| q.is_empty())
     }
 
@@ -625,10 +654,12 @@ impl<K: Hash + Eq + Clone, V: Clone> SimHook for KeyedSingletonHook<K, V> {
     ) -> bool {
         let mut current_input = self.input.borrow_mut();
         self.to_release = Some(vec![]);
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         let nonempty_key_count = current_input.values().filter(|q| !q.is_empty()).count();
 
         let mut remaining_nonempty_keys = nonempty_key_count;
         let mut any_nontrivial = false;
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
         for (key, queue) in current_input.iter_mut() {
             if queue.is_empty() {
                 self.to_release.as_mut().unwrap().push((
@@ -684,7 +715,7 @@ impl<K: Hash + Eq + Clone, V: Clone> SimHook for KeyedSingletonHook<K, V> {
         if let Some(to_release) = self.to_release.take() {
             let (batch_location, line, caret_indent) = self.batch_location;
             let note_str = if to_release.is_empty() {
-                "^ releasing no items".to_string()
+                "^ releasing no items".to_owned()
             } else {
                 let mut mapping_text = String::new();
                 for (key, value, is_new) in &to_release {
@@ -787,7 +818,7 @@ impl<T> SimInlineHook for StreamOrderHook<T> {
             if !to_release.is_empty() {
                 let (batch_location, line, caret_indent) = self.batch_location;
                 let note_str = format!(
-                    "^ ordered items: {:?}",
+                    "^ observed non-deterministic order: {:?}",
                     TruncatedVecDebug(RefCell::new(Some(to_release.iter())), 8, self.format_debug)
                 );
 
@@ -897,7 +928,7 @@ impl<K: Hash + Eq + Clone, V> SimInlineHook for KeyedStreamOrderHook<K, V> {
                     }
                     note_str.push_str(&entry_text);
                 }
-                note_str = format!("^ ordered items: {{ {} }}", note_str);
+                note_str = format!("^ observed non-deterministic order: {{ {} }}", note_str);
 
                 let _ = writeln!(
                     log_writer,
@@ -927,5 +958,214 @@ impl<K: Hash + Eq + Clone, V> SimInlineHook for KeyedStreamOrderHook<K, V> {
         } else {
             panic!("No decision to release");
         }
+    }
+}
+
+pub struct TopLevelStreamOrderHook<T> {
+    pub input: Rc<RefCell<VecDeque<T>>>,
+    pub to_release: Option<Vec<T>>,
+    pub output: UnboundedSender<T>,
+    pub location: HookLocationMeta,
+    pub format_item_debug: fn(&T) -> Option<String>,
+}
+
+impl<T> SimHook for TopLevelStreamOrderHook<T> {
+    fn current_decision(&self) -> Option<bool> {
+        self.to_release.as_ref().map(|v| !v.is_empty())
+    }
+
+    fn can_make_nontrivial_decision(&self) -> bool {
+        !self.input.borrow().is_empty()
+    }
+
+    fn autonomous_decision<'a>(
+        &mut self,
+        driver: &mut Borrowed<'a>,
+        force_nontrivial: bool,
+    ) -> bool {
+        let mut current_input = self.input.borrow_mut();
+        let mut out = vec![];
+
+        // instead of a full shuffle, we only release one element at a time
+        // in order to handle possible feedback cycles
+        if !current_input.is_empty() {
+            let must_release = force_nontrivial && out.is_empty();
+            if !must_release && produce().generate(driver).unwrap() {
+                // don't release anything
+            } else {
+                let idx = (0..current_input.len()).generate(driver).unwrap();
+                let item = current_input.remove(idx).unwrap();
+                out.push(item);
+            }
+        }
+
+        let was_nontrivial = !out.is_empty();
+        self.to_release = Some(out);
+        was_nontrivial
+    }
+
+    fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
+        if let Some(to_release) = self.to_release.take() {
+            if !to_release.is_empty() {
+                let (batch_location, line, caret_indent) = self.location;
+                let note_str = format!(
+                    "^ observered non-deterministic order: {:?}",
+                    TruncatedVecDebug(
+                        RefCell::new(Some(to_release.iter())),
+                        8,
+                        self.format_item_debug
+                    )
+                );
+
+                let _ = writeln!(
+                    log_writer,
+                    "\n{} {}",
+                    "-->".color(colored::Color::Blue),
+                    batch_location
+                );
+
+                let _ = writeln!(log_writer, " {}{}", "|".color(colored::Color::Blue), line);
+
+                let _ = writeln!(
+                    log_writer,
+                    " {}{}{}",
+                    "|".color(colored::Color::Blue),
+                    caret_indent,
+                    note_str.color(colored::Color::Green)
+                );
+            }
+
+            for item in to_release {
+                self.output.send(item).unwrap();
+            }
+        } else {
+            panic!("No decision to release");
+        }
+    }
+}
+
+pub struct TopLevelKeyedStreamOrderHook<K: Hash + Eq + Clone, V> {
+    pub input: Rc<RefCell<FxHashMap<K, VecDeque<V>>>>,
+    pub to_release: Option<Vec<(K, V)>>,
+    pub output: UnboundedSender<(K, V)>,
+    pub location: HookLocationMeta,
+    pub format_item_debug: fn(&(K, V)) -> Option<String>,
+}
+
+impl<K: Hash + Eq + Clone, V> SimHook for TopLevelKeyedStreamOrderHook<K, V> {
+    fn current_decision(&self) -> Option<bool> {
+        self.to_release.as_ref().map(|v| !v.is_empty())
+    }
+
+    fn can_make_nontrivial_decision(&self) -> bool {
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
+        !self.input.borrow().values().all(|q| q.is_empty())
+    }
+
+    fn autonomous_decision<'a>(
+        &mut self,
+        driver: &mut Borrowed<'a>,
+        force_nontrivial: bool,
+    ) -> bool {
+        let mut current_input = self.input.borrow_mut();
+
+        // Collect non-empty keys with their queue lengths
+        #[expect(clippy::disallowed_methods, reason = "FxHasher is deterministic")]
+        let nonempty_keys: Vec<(K, usize)> = current_input
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(k, q)| (k.clone(), q.len()))
+            .collect();
+
+        if nonempty_keys.is_empty() {
+            self.to_release = Some(vec![]);
+            return false;
+        }
+
+        // Decide whether to release anything
+        if !force_nontrivial && produce().generate(driver).unwrap() {
+            self.to_release = Some(vec![]);
+            return false;
+        }
+
+        // Pick which key to release from
+        let key_idx = (0..nonempty_keys.len()).generate(driver).unwrap();
+        let (key, queue_len) = &nonempty_keys[key_idx];
+
+        // Pick which item from that key's queue
+        let item_idx = (0..*queue_len).generate(driver).unwrap();
+        let item = current_input
+            .get_mut(key)
+            .unwrap()
+            .remove(item_idx)
+            .unwrap();
+
+        self.to_release = Some(vec![(key.clone(), item)]);
+        true
+    }
+
+    fn release_decision(&mut self, log_writer: &mut dyn std::fmt::Write) {
+        if let Some(to_release) = self.to_release.take() {
+            if !to_release.is_empty() {
+                let (batch_location, line, caret_indent) = self.location;
+                let note_str = format!(
+                    "^ observed non-deterministic order: {:?}",
+                    TruncatedVecDebug(
+                        RefCell::new(Some(to_release.iter())),
+                        8,
+                        self.format_item_debug
+                    )
+                );
+
+                let _ = writeln!(
+                    log_writer,
+                    "\n{} {}",
+                    "-->".color(colored::Color::Blue),
+                    batch_location
+                );
+
+                let _ = writeln!(log_writer, " {}{}", "|".color(colored::Color::Blue), line);
+
+                let _ = writeln!(
+                    log_writer,
+                    " {}{}{}",
+                    "|".color(colored::Color::Blue),
+                    caret_indent,
+                    note_str.color(colored::Color::Green)
+                );
+            }
+
+            for item in to_release {
+                self.output.send(item).unwrap();
+            }
+        } else {
+            panic!("No decision to release");
+        }
+    }
+}
+
+#[cfg(test)]
+mod maybe_debug_tests {
+    struct NotDebuggable;
+
+    #[derive(Debug)]
+    struct Debuggable;
+
+    #[test]
+    fn test_non_debug_type_returns_none() {
+        let fmt_fn: fn(&NotDebuggable) -> Option<String> = crate::__maybe_debug__!(NotDebuggable);
+        assert_eq!(fmt_fn(&NotDebuggable), None);
+    }
+
+    #[test]
+    fn test_debug_type_returns_some() {
+        let fmt_fn: fn(&Debuggable) -> Option<String> = crate::__maybe_debug__!(Debuggable);
+        assert_eq!(fmt_fn(&Debuggable), Some("Debuggable".to_owned()));
+    }
+
+    #[test]
+    fn test_primitive_debug() {
+        let fmt_fn: fn(&i32) -> Option<String> = crate::__maybe_debug__!(i32);
+        assert_eq!(fmt_fn(&42), Some("42".to_owned()));
     }
 }

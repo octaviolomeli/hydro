@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::{Arc, Weak};
@@ -7,7 +7,6 @@ use std::sync::{Arc, Weak};
 use anyhow::{Result, bail};
 use append_only_vec::AppendOnlyVec;
 use async_recursion::async_recursion;
-use dyn_clone::DynClone;
 use hydro_deploy_integration::ServerPort;
 use tokio::sync::RwLock;
 
@@ -42,7 +41,7 @@ pub trait RustCrateSource: Send + Sync {
     }
 }
 
-pub trait RustCrateServer: DynClone + Debug + Send + Sync {
+pub trait RustCrateServer: Debug + Send + Sync {
     fn get_port(&self) -> ServerPort;
     fn launched_host(&self) -> Arc<dyn LaunchedHost>;
 }
@@ -418,16 +417,16 @@ async fn forward_connection(conn: &ServerPort, target: &dyn LaunchedHost) -> Ser
         ServerPort::UnixSocket(_) => panic!("Expected a TCP port to be forwarded"),
         ServerPort::TcpPort(addr) => ServerPort::TcpPort(target.forward_port(addr).await.unwrap()),
         ServerPort::Demux(demux) => {
-            let mut forwarded_map = HashMap::new();
+            let mut forwarded_map = BTreeMap::new();
             for (key, conn) in demux {
-                forwarded_map.insert(*key, forward_connection(conn, target).await);
+                forwarded_map.insert(*key, forward_connection(conn, target).await); // TODO(mingwei): do in parallel?
             }
             ServerPort::Demux(forwarded_map)
         }
         ServerPort::Merge(merge) => {
             let mut forwarded_vec = Vec::new();
             for conn in merge {
-                forwarded_vec.push(forward_connection(conn, target).await);
+                forwarded_vec.push(forward_connection(conn, target).await); // TODO(mingwei): do in parallel?
             }
             ServerPort::Merge(forwarded_vec)
         }
@@ -453,9 +452,9 @@ impl ServerConfig {
             }
 
             ServerConfig::Demux(demux) => {
-                let mut demux_map = HashMap::new();
+                let mut demux_map = BTreeMap::new();
                 for (key, conn) in demux {
-                    demux_map.insert(*key, conn.load_instantiated(select).await);
+                    demux_map.insert(*key, conn.load_instantiated(select).await); // TODO(mingwei): do in parallel?
                 }
                 ServerPort::Demux(demux_map)
             }
@@ -478,7 +477,7 @@ impl ServerConfig {
             ServerConfig::Merge(merge) => {
                 let mut merge_vec = Vec::new();
                 for conn in merge.iter() {
-                    merge_vec.push(conn.load_instantiated(select).await);
+                    merge_vec.push(conn.load_instantiated(select).await); // TODO(mingwei): do in parallel?
                 }
                 ServerPort::Merge(merge_vec)
             }

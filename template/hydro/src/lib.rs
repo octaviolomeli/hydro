@@ -16,7 +16,7 @@ mod tests {
 
     #[test]
     fn test_echo_capitalize() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process();
 
         let (in_port, requests) = process.sim_input();
@@ -24,8 +24,8 @@ mod tests {
         let out_port = responses.sim_output();
 
         flow.sim().exhaustive(async || {
-            in_port.send("hello".to_string());
-            in_port.send("world".to_string());
+            in_port.send("hello".to_owned());
+            in_port.send("world".to_owned());
 
             out_port.assert_yields_only(["HELLO", "WORLD"]).await;
         });

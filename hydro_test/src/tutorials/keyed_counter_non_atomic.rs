@@ -20,16 +20,24 @@ pub fn keyed_counter_service_buggy<'a, L: Location<'a> + NoTick, O: Ordering>(
         .value_counts();
     let increment_ack = increment_requests;
 
-    let get_response = sliced! {
-        let request_batch = use(get_requests, nondet!(/** we never observe batch boundaries */));
+    let requests_regrouped = get_requests
+        .entries()
+        .map(q!(|(cid, key)| (key, cid)))
+        .into_keyed();
+
+    let get_lookup = sliced! {
+        let request_batch = use(requests_regrouped, nondet!(/** we never observe batch boundaries */));
         let count_snapshot = use(current_count, nondet!(/** atomicity guarantees consistency wrt increments */));
 
-        count_snapshot.get_many_if_present(request_batch.entries().map(q!(|(cid, key)| (key, cid))).into_keyed())
-            .entries()
-            .map(q!(|(key, (count, client))| (client, (key, count))))
+        request_batch.join_keyed_singleton(count_snapshot)
     };
 
-    (increment_ack, get_response.into_keyed())
+    let get_response = get_lookup
+        .entries()
+        .map(q!(|(key, (client, count))| (client, (key, count))))
+        .into_keyed();
+
+    (increment_ack, get_response)
 }
 
 #[cfg(test)]
@@ -41,7 +49,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_counter_read_after_write_buggy() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process::<CounterServer>();
 
         let (inc_in_port, inc_requests) = process.sim_input();
@@ -56,20 +64,20 @@ mod tests {
         let get_out_port = get_responses.entries().sim_output();
 
         flow.sim().exhaustive(async || {
-            inc_in_port.send((1, "abc".to_string()));
+            inc_in_port.send((1, "abc".to_owned()));
             inc_out_port
-                .assert_yields_unordered([(1, "abc".to_string())])
+                .assert_yields_unordered([(1, "abc".to_owned())])
                 .await;
-            get_in_port.send((1, "abc".to_string()));
+            get_in_port.send((1, "abc".to_owned()));
             get_out_port
-                .assert_yields_only_unordered([(1, ("abc".to_string(), 1))])
+                .assert_yields_only_unordered([(1, ("abc".to_owned(), 1))])
                 .await;
         });
     }
 
     #[test]
     fn test_counter_read_after_write_instances() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process::<CounterServer>();
 
         let (inc_in_port, inc_requests) = process.sim_input();
@@ -84,11 +92,11 @@ mod tests {
         let get_out_port = get_responses.entries().sim_output();
 
         let instances = flow.sim().exhaustive(async || {
-            inc_in_port.send((1, "abc".to_string()));
+            inc_in_port.send((1, "abc".to_owned()));
             inc_out_port
-                .assert_yields_unordered([(1, "abc".to_string())])
+                .assert_yields_unordered([(1, "abc".to_owned())])
                 .await;
-            get_in_port.send((1, "abc".to_string()));
+            get_in_port.send((1, "abc".to_owned()));
             let _ = get_out_port.collect_sorted::<Vec<_>>().await;
         });
 

@@ -15,23 +15,27 @@ use hydro_deploy::custom_service::CustomClientPort;
 use hydro_deploy::rust_crate::RustCrateService;
 use hydro_deploy::rust_crate::ports::{DemuxSink, RustCrateSink, RustCrateSource, TaggedSource};
 use hydro_deploy::rust_crate::tracing_options::TracingOptions;
-use hydro_deploy::{CustomService, Deployment, Host, RustCrate, TracingResults};
+use hydro_deploy::{CustomService, Deployment, Host, RustCrate};
 use hydro_deploy_integration::{ConnectedSink, ConnectedSource};
 use nameof::name_of;
 use proc_macro2::Span;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use slotmap::SparseSecondaryMap;
 use stageleft::{QuotedWithContext, RuntimeData};
 use syn::parse_quote;
 
 use super::deploy_runtime::*;
+use crate::compile::builder::ExternalPortId;
 use crate::compile::deploy_provider::{
     ClusterSpec, Deploy, ExternalSpec, IntoProcessSpec, Node, ProcessSpec, RegisterPort,
 };
-use crate::compile::trybuild::generate::{HYDRO_RUNTIME_FEATURES, create_graph_trybuild};
+use crate::compile::trybuild::generate::{
+    HYDRO_RUNTIME_FEATURES, LinkingMode, create_graph_trybuild,
+};
 use crate::location::dynamic::LocationId;
 use crate::location::member_id::TaglessMemberId;
-use crate::location::{MembershipEvent, NetworkHint};
+use crate::location::{LocationKey, MembershipEvent, NetworkHint};
 use crate::staging_util::get_this_crate;
 
 /// Deployment backend that uses [`hydro_deploy`] for provisioning and launching.
@@ -41,33 +45,29 @@ use crate::staging_util::get_this_crate;
 pub enum HydroDeploy {}
 
 impl<'a> Deploy<'a> for HydroDeploy {
+    /// Map from Cluster location ID to member IDs.
+    type Meta = SparseSecondaryMap<LocationKey, Vec<TaglessMemberId>>;
     type InstantiateEnv = Deployment;
+
     type Process = DeployNode;
     type Cluster = DeployCluster;
     type External = DeployExternal;
-    type Meta = HashMap<usize, Vec<TaglessMemberId>>;
-    type GraphId = ();
-    type Port = String;
-    type ExternalRawPort = CustomClientPort;
-
-    fn allocate_process_port(process: &Self::Process) -> Self::Port {
-        process.next_port()
-    }
-
-    fn allocate_cluster_port(cluster: &Self::Cluster) -> Self::Port {
-        cluster.next_port()
-    }
-
-    fn allocate_external_port(external: &Self::External) -> Self::Port {
-        external.next_port()
-    }
 
     fn o2o_sink_source(
+        _env: &mut Self::InstantiateEnv,
         _p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         _p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
+        _name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
         let p1_port = p1_port.as_str();
         let p2_port = p2_port.as_str();
         deploy_o2o(
@@ -79,9 +79,9 @@ impl<'a> Deploy<'a> for HydroDeploy {
 
     fn o2o_connect(
         p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
     ) -> Box<dyn FnOnce()> {
         let p1 = p1.clone();
         let p1_port = p1_port.clone();
@@ -102,11 +102,20 @@ impl<'a> Deploy<'a> for HydroDeploy {
     }
 
     fn o2m_sink_source(
+        _env: &mut Self::InstantiateEnv,
         _p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         _c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
+        _name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
         let p1_port = p1_port.as_str();
         let c2_port = c2_port.as_str();
         deploy_o2m(
@@ -118,9 +127,9 @@ impl<'a> Deploy<'a> for HydroDeploy {
 
     fn o2m_connect(
         p1: &Self::Process,
-        p1_port: &Self::Port,
+        p1_port: &<Self::Process as Node>::Port,
         c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
     ) -> Box<dyn FnOnce()> {
         let p1 = p1.clone();
         let p1_port = p1_port.clone();
@@ -153,11 +162,20 @@ impl<'a> Deploy<'a> for HydroDeploy {
     }
 
     fn m2o_sink_source(
+        _env: &mut Self::InstantiateEnv,
         _c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         _p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
+        _name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
         let c1_port = c1_port.as_str();
         let p2_port = p2_port.as_str();
         deploy_m2o(
@@ -169,9 +187,9 @@ impl<'a> Deploy<'a> for HydroDeploy {
 
     fn m2o_connect(
         c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
     ) -> Box<dyn FnOnce()> {
         let c1 = c1.clone();
         let c1_port = c1_port.clone();
@@ -196,11 +214,20 @@ impl<'a> Deploy<'a> for HydroDeploy {
     }
 
     fn m2m_sink_source(
+        _env: &mut Self::InstantiateEnv,
         _c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         _c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
+        _name: Option<&str>,
+        networking_info: &crate::networking::NetworkingInfo,
     ) -> (syn::Expr, syn::Expr) {
+        match networking_info {
+            crate::networking::NetworkingInfo::Tcp {
+                fault: crate::networking::TcpFault::FailStop,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
         let c1_port = c1_port.as_str();
         let c2_port = c2_port.as_str();
         deploy_m2m(
@@ -212,9 +239,9 @@ impl<'a> Deploy<'a> for HydroDeploy {
 
     fn m2m_connect(
         c1: &Self::Cluster,
-        c1_port: &Self::Port,
+        c1_port: &<Self::Cluster as Node>::Port,
         c2: &Self::Cluster,
-        c2_port: &Self::Port,
+        c2_port: &<Self::Cluster as Node>::Port,
     ) -> Box<dyn FnOnce()> {
         let c1 = c1.clone();
         let c1_port = c1_port.clone();
@@ -253,7 +280,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
     fn e2o_many_source(
         extra_stmts: &mut Vec<syn::Stmt>,
         _p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
         codec_type: &syn::Type,
         shared_handle: String,
     ) -> syn::Expr {
@@ -279,7 +306,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
         extra_stmts.push(syn::parse_quote! {
             let #connect_ident = __hydro_lang_trybuild_cli
                 .port(#p2_port)
-                .connect::<#root::runtime_support::dfir_rs::util::deploy::multi_connection::ConnectedMultiConnection<_, _, #codec_type>>();
+                .connect::<#root::runtime_support::hydro_deploy_integration::multi_connection::ConnectedMultiConnection<_, _, #codec_type>>();
         });
 
         extra_stmts.push(syn::parse_quote! {
@@ -308,9 +335,9 @@ impl<'a> Deploy<'a> for HydroDeploy {
     fn e2o_source(
         extra_stmts: &mut Vec<syn::Stmt>,
         _p1: &Self::External,
-        _p1_port: &Self::Port,
+        _p1_port: &<Self::External as Node>::Port,
         _p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
         codec_type: &syn::Type,
         shared_handle: String,
     ) -> syn::Expr {
@@ -332,7 +359,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
         extra_stmts.push(syn::parse_quote! {
             let #connect_ident = __hydro_lang_trybuild_cli
                 .port(#p2_port)
-                .connect::<#root::runtime_support::dfir_rs::util::deploy::single_connection::ConnectedSingleConnection<_, _, #codec_type>>();
+                .connect::<#root::runtime_support::hydro_deploy_integration::single_connection::ConnectedSingleConnection<_, _, #codec_type>>();
         });
 
         extra_stmts.push(syn::parse_quote! {
@@ -348,9 +375,9 @@ impl<'a> Deploy<'a> for HydroDeploy {
 
     fn e2o_connect(
         p1: &Self::External,
-        p1_port: &Self::Port,
+        p1_port: &<Self::External as Node>::Port,
         p2: &Self::Process,
-        p2_port: &Self::Port,
+        p2_port: &<Self::Process as Node>::Port,
         _many: bool,
         server_hint: NetworkHint,
     ) -> Box<dyn FnOnce()> {
@@ -384,9 +411,9 @@ impl<'a> Deploy<'a> for HydroDeploy {
 
     fn o2e_sink(
         _p1: &Self::Process,
-        _p1_port: &Self::Port,
+        _p1_port: &<Self::Process as Node>::Port,
         _p2: &Self::External,
-        _p2_port: &Self::Port,
+        _p2_port: &<Self::External as Node>::Port,
         shared_handle: String,
     ) -> syn::Expr {
         let sink_ident = syn::Ident::new(
@@ -397,7 +424,7 @@ impl<'a> Deploy<'a> for HydroDeploy {
     }
 
     fn cluster_ids(
-        of_cluster: usize,
+        of_cluster: LocationKey,
     ) -> impl QuotedWithContext<'a, &'a [TaglessMemberId], ()> + Clone + 'a {
         cluster_members(RuntimeData::new("__hydro_lang_trybuild_cli"), of_cluster)
     }
@@ -407,6 +434,8 @@ impl<'a> Deploy<'a> for HydroDeploy {
     }
 
     fn cluster_membership_stream(
+        _env: &mut Self::InstantiateEnv,
+        _at_location: &LocationId,
         location_id: &LocationId,
     ) -> impl QuotedWithContext<'a, Box<dyn Stream<Item = (TaglessMemberId, MembershipEvent)> + Unpin>, ()>
     {
@@ -439,10 +468,6 @@ pub trait DeployCrateWrapper {
     ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         self.underlying().stderr_filter(prefix.into())
     }
-
-    fn tracing_results(&self) -> Option<TracingResults> {
-        self.underlying().tracing_results().cloned()
-    }
 }
 
 #[expect(missing_docs, reason = "TODO")]
@@ -451,10 +476,12 @@ pub struct TrybuildHost {
     host: Arc<dyn Host>,
     display_name: Option<String>,
     rustflags: Option<String>,
+    profile: Option<String>,
     additional_hydro_features: Vec<String>,
     features: Vec<String>,
     tracing: Option<TracingOptions>,
     build_envs: Vec<(String, String)>,
+    env: HashMap<String, String>,
     name_hint: Option<String>,
     cluster_idx: Option<usize>,
 }
@@ -465,10 +492,12 @@ impl From<Arc<dyn Host>> for TrybuildHost {
             host,
             display_name: None,
             rustflags: None,
+            profile: None,
             additional_hydro_features: vec![],
             features: vec![],
             tracing: None,
             build_envs: vec![],
+            env: HashMap::new(),
             name_hint: None,
             cluster_idx: None,
         }
@@ -481,10 +510,12 @@ impl<H: Host + 'static> From<Arc<H>> for TrybuildHost {
             host,
             display_name: None,
             rustflags: None,
+            profile: None,
             additional_hydro_features: vec![],
             features: vec![],
             tracing: None,
             build_envs: vec![],
+            env: HashMap::new(),
             name_hint: None,
             cluster_idx: None,
         }
@@ -498,10 +529,12 @@ impl TrybuildHost {
             host,
             display_name: None,
             rustflags: None,
+            profile: None,
             additional_hydro_features: vec![],
             features: vec![],
             tracing: None,
             build_envs: vec![],
+            env: HashMap::new(),
             name_hint: None,
             cluster_idx: None,
         }
@@ -525,6 +558,17 @@ impl TrybuildHost {
 
         Self {
             rustflags: Some(rustflags.into()),
+            ..self
+        }
+    }
+
+    pub fn profile(self, profile: impl Into<String>) -> Self {
+        if self.profile.is_some() {
+            panic!("{} already set", name_of!(profile in Self));
+        }
+
+        Self {
+            profile: Some(profile.into()),
             ..self
         }
     }
@@ -564,6 +608,12 @@ impl TrybuildHost {
             ..self
         }
     }
+
+    pub fn env(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let mut env = self.env;
+        env.insert(key.into(), value.into());
+        Self { env, ..self }
+    }
 }
 
 impl IntoProcessSpec<'_, HydroDeploy> for Arc<dyn Host> {
@@ -573,10 +623,12 @@ impl IntoProcessSpec<'_, HydroDeploy> for Arc<dyn Host> {
             host: self,
             display_name: None,
             rustflags: None,
+            profile: None,
             additional_hydro_features: vec![],
             features: vec![],
             tracing: None,
             build_envs: vec![],
+            env: HashMap::new(),
             name_hint: None,
             cluster_idx: None,
         }
@@ -590,10 +642,12 @@ impl<H: Host + 'static> IntoProcessSpec<'_, HydroDeploy> for Arc<H> {
             host: self,
             display_name: None,
             rustflags: None,
+            profile: None,
             additional_hydro_features: vec![],
             features: vec![],
             tracing: None,
             build_envs: vec![],
+            env: HashMap::new(),
             name_hint: None,
             cluster_idx: None,
         }
@@ -607,37 +661,44 @@ pub struct DeployExternal {
     host: Arc<dyn Host>,
     underlying: Rc<RefCell<Option<Arc<CustomService>>>>,
     client_ports: Rc<RefCell<HashMap<String, CustomClientPort>>>,
-    allocated_ports: Rc<RefCell<HashMap<usize, String>>>,
+    allocated_ports: Rc<RefCell<HashMap<ExternalPortId, String>>>,
+}
+
+impl DeployExternal {
+    pub(crate) fn raw_port(&self, external_port_id: ExternalPortId) -> CustomClientPort {
+        self.client_ports
+            .borrow()
+            .get(
+                self.allocated_ports
+                    .borrow()
+                    .get(&external_port_id)
+                    .unwrap(),
+            )
+            .unwrap()
+            .clone()
+    }
 }
 
 impl<'a> RegisterPort<'a, HydroDeploy> for DeployExternal {
-    fn register(&self, key: usize, port: <HydroDeploy as Deploy>::Port) {
+    fn register(&self, external_port_id: ExternalPortId, port: Self::Port) {
         assert!(
             self.allocated_ports
                 .borrow_mut()
-                .insert(key, port.clone())
+                .insert(external_port_id, port.clone())
                 .is_none_or(|old| old == port)
         );
     }
 
-    fn raw_port(&self, key: usize) -> <HydroDeploy as Deploy<'_>>::ExternalRawPort {
-        self.client_ports
-            .borrow()
-            .get(self.allocated_ports.borrow().get(&key).unwrap())
-            .unwrap()
-            .clone()
-    }
-
     fn as_bytes_bidi(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<
         Output = (
             Pin<Box<dyn Stream<Item = Result<BytesMut, Error>>>>,
             Pin<Box<dyn Sink<Bytes, Error = Error>>>,
         ),
     > + 'a {
-        let port = self.raw_port(key);
+        let port = self.raw_port(external_port_id);
 
         async move {
             let (source, sink) = port.connect().await.into_source_sink();
@@ -650,7 +711,7 @@ impl<'a> RegisterPort<'a, HydroDeploy> for DeployExternal {
 
     fn as_bincode_bidi<InT, OutT>(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<
         Output = (
             Pin<Box<dyn Stream<Item = OutT>>>,
@@ -661,7 +722,7 @@ impl<'a> RegisterPort<'a, HydroDeploy> for DeployExternal {
         InT: Serialize + 'static,
         OutT: DeserializeOwned + 'static,
     {
-        let port = self.raw_port(key);
+        let port = self.raw_port(external_port_id);
         async move {
             let (source, sink) = port.connect().await.into_source_sink();
             (
@@ -676,9 +737,9 @@ impl<'a> RegisterPort<'a, HydroDeploy> for DeployExternal {
 
     fn as_bincode_sink<T: Serialize + 'static>(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<Output = Pin<Box<dyn Sink<T, Error = Error>>>> + 'a {
-        let port = self.raw_port(key);
+        let port = self.raw_port(external_port_id);
         async move {
             let sink = port.connect().await.into_sink();
             Box::pin(sink.with(|item| async move { Ok(bincode::serialize(&item).unwrap().into()) }))
@@ -688,9 +749,9 @@ impl<'a> RegisterPort<'a, HydroDeploy> for DeployExternal {
 
     fn as_bincode_source<T: DeserializeOwned + 'static>(
         &self,
-        key: usize,
+        external_port_id: ExternalPortId,
     ) -> impl Future<Output = Pin<Box<dyn Stream<Item = T>>>> + 'a {
-        let port = self.raw_port(key);
+        let port = self.raw_port(external_port_id);
         async move {
             let source = port.connect().await.into_source();
             Box::pin(source.map(|item| bincode::deserialize(&item.unwrap()).unwrap()))
@@ -701,7 +762,8 @@ impl<'a> RegisterPort<'a, HydroDeploy> for DeployExternal {
 
 impl Node for DeployExternal {
     type Port = String;
-    type Meta = HashMap<usize, Vec<TaglessMemberId>>;
+    /// Map from Cluster location ID to member IDs.
+    type Meta = SparseSecondaryMap<LocationKey, Vec<TaglessMemberId>>;
     type InstantiateEnv = Deployment;
 
     fn next_port(&self) -> Self::Port {
@@ -716,8 +778,11 @@ impl Node for DeployExternal {
         env: &mut Self::InstantiateEnv,
         _meta: &mut Self::Meta,
         _graph: DfirGraph,
-        _extra_stmts: Vec<syn::Stmt>,
+        extra_stmts: &[syn::Stmt],
+        sidecars: &[syn::Expr],
     ) {
+        assert!(extra_stmts.is_empty());
+        assert!(sidecars.is_empty());
         let service = env.CustomService(self.host.clone(), vec![]);
         *self.underlying.borrow_mut() = Some(service);
     }
@@ -726,7 +791,7 @@ impl Node for DeployExternal {
 }
 
 impl ExternalSpec<'_, HydroDeploy> for Arc<dyn Host> {
-    fn build(self, _id: usize, _name_hint: &str) -> DeployExternal {
+    fn build(self, _key: LocationKey, _name_hint: &str) -> DeployExternal {
         DeployExternal {
             next_port: Rc::new(RefCell::new(0)),
             host: self,
@@ -738,7 +803,7 @@ impl ExternalSpec<'_, HydroDeploy> for Arc<dyn Host> {
 }
 
 impl<H: Host + 'static> ExternalSpec<'_, HydroDeploy> for Arc<H> {
-    fn build(self, _id: usize, _name_hint: &str) -> DeployExternal {
+    fn build(self, _key: LocationKey, _name_hint: &str) -> DeployExternal {
         DeployExternal {
             next_port: Rc::new(RefCell::new(0)),
             host: self,
@@ -757,7 +822,6 @@ pub(crate) enum CrateOrTrybuild {
 #[expect(missing_docs, reason = "TODO")]
 #[derive(Clone)]
 pub struct DeployNode {
-    id: usize,
     next_port: Rc<RefCell<usize>>,
     service_spec: Rc<RefCell<Option<CrateOrTrybuild>>>,
     underlying: Rc<RefCell<Option<Arc<RustCrateService>>>>,
@@ -771,7 +835,8 @@ impl DeployCrateWrapper for DeployNode {
 
 impl Node for DeployNode {
     type Port = String;
-    type Meta = HashMap<usize, Vec<TaglessMemberId>>;
+    /// Map from Cluster location ID to member IDs.
+    type Meta = SparseSecondaryMap<LocationKey, Vec<TaglessMemberId>>;
     type InstantiateEnv = Deployment;
 
     fn next_port(&self) -> String {
@@ -786,7 +851,6 @@ impl Node for DeployNode {
         underlying_node.as_ref().unwrap().update_meta(HydroMeta {
             clusters: meta.clone(),
             cluster_id: None,
-            subgraph_id: self.id,
         });
     }
 
@@ -795,21 +859,39 @@ impl Node for DeployNode {
         env: &mut Self::InstantiateEnv,
         _meta: &mut Self::Meta,
         graph: DfirGraph,
-        extra_stmts: Vec<syn::Stmt>,
+        extra_stmts: &[syn::Stmt],
+        sidecars: &[syn::Expr],
     ) {
         let (service, host) = match self.service_spec.borrow_mut().take().unwrap() {
             CrateOrTrybuild::Crate(c, host) => (c, host),
             CrateOrTrybuild::Trybuild(trybuild) => {
-                let (bin_name, config) =
-                    create_graph_trybuild(graph, extra_stmts, &trybuild.name_hint, false);
+                // Determine linking mode based on host target type
+                let linking_mode = if !cfg!(target_os = "windows")
+                    && trybuild.host.target_type() == hydro_deploy::HostTargetType::Local
+                {
+                    // When compiling for local, prefer dynamic linking to reduce binary size
+                    // Windows is currently not supported due to https://github.com/bevyengine/bevy/pull/2016
+                    LinkingMode::Dynamic
+                } else {
+                    LinkingMode::Static
+                };
+                let (bin_name, config) = create_graph_trybuild(
+                    graph,
+                    extra_stmts,
+                    sidecars,
+                    trybuild.name_hint.as_deref(),
+                    crate::compile::trybuild::generate::DeployMode::HydroDeploy,
+                    linking_mode,
+                );
                 let host = trybuild.host.clone();
                 (
                     create_trybuild_service(
                         trybuild,
                         &config.project_dir,
                         &config.target_dir,
-                        &config.features,
+                        config.features.as_deref(),
                         &bin_name,
+                        &config.linking_mode,
                     ),
                     host,
                 )
@@ -834,7 +916,7 @@ impl DeployCrateWrapper for DeployClusterNode {
 #[expect(missing_docs, reason = "TODO")]
 #[derive(Clone)]
 pub struct DeployCluster {
-    id: usize,
+    key: LocationKey,
     next_port: Rc<RefCell<usize>>,
     cluster_spec: Rc<RefCell<Option<Vec<CrateOrTrybuild>>>>,
     members: Rc<RefCell<Vec<DeployClusterNode>>>,
@@ -850,7 +932,8 @@ impl DeployCluster {
 
 impl Node for DeployCluster {
     type Port = String;
-    type Meta = HashMap<usize, Vec<TaglessMemberId>>;
+    /// Map from Cluster location ID to member IDs.
+    type Meta = SparseSecondaryMap<LocationKey, Vec<TaglessMemberId>>;
     type InstantiateEnv = Deployment;
 
     fn next_port(&self) -> String {
@@ -865,7 +948,8 @@ impl Node for DeployCluster {
         env: &mut Self::InstantiateEnv,
         meta: &mut Self::Meta,
         graph: DfirGraph,
-        extra_stmts: Vec<syn::Stmt>,
+        extra_stmts: &[syn::Stmt],
+        sidecars: &[syn::Expr],
     ) {
         let has_trybuild = self
             .cluster_spec
@@ -875,12 +959,34 @@ impl Node for DeployCluster {
             .iter()
             .any(|spec| matches!(spec, CrateOrTrybuild::Trybuild { .. }));
 
+        // For clusters, use static linking if ANY host is non-local (conservative approach)
+        let linking_mode = if !cfg!(target_os = "windows")
+            && self
+                .cluster_spec
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|spec| match spec {
+                    CrateOrTrybuild::Crate(_, _) => true, // crates handle their own linking
+                    CrateOrTrybuild::Trybuild(t) => {
+                        t.host.target_type() == hydro_deploy::HostTargetType::Local
+                    }
+                }) {
+            // See comment above for Windows exception
+            LinkingMode::Dynamic
+        } else {
+            LinkingMode::Static
+        };
+
         let maybe_trybuild = if has_trybuild {
             Some(create_graph_trybuild(
                 graph,
                 extra_stmts,
-                &self.name_hint,
-                false,
+                sidecars,
+                self.name_hint.as_deref(),
+                crate::compile::trybuild::generate::DeployMode::HydroDeploy,
+                linking_mode,
             ))
         } else {
             None
@@ -903,8 +1009,9 @@ impl Node for DeployCluster {
                                 trybuild,
                                 &config.project_dir,
                                 &config.target_dir,
-                                &config.features,
+                                config.features.as_deref(),
                                 bin_name,
+                                &config.linking_mode,
                             ),
                             host,
                         )
@@ -915,7 +1022,7 @@ impl Node for DeployCluster {
             })
             .collect::<Vec<_>>();
         meta.insert(
-            self.id,
+            self.key,
             (0..(cluster_nodes.len() as u32))
                 .map(TaglessMemberId::from_raw_id)
                 .collect(),
@@ -931,7 +1038,6 @@ impl Node for DeployCluster {
             node.underlying.update_meta(HydroMeta {
                 clusters: meta.clone(),
                 cluster_id: Some(TaglessMemberId::from_raw_id(cluster_id as u32)),
-                subgraph_id: self.id,
             });
         }
     }
@@ -949,9 +1055,8 @@ impl DeployProcessSpec {
 }
 
 impl ProcessSpec<'_, HydroDeploy> for DeployProcessSpec {
-    fn build(self, id: usize, _name_hint: &str) -> DeployNode {
+    fn build(self, _key: LocationKey, _name_hint: &str) -> DeployNode {
         DeployNode {
-            id,
             next_port: Rc::new(RefCell::new(0)),
             service_spec: Rc::new(RefCell::new(Some(CrateOrTrybuild::Crate(self.0, self.1)))),
             underlying: Rc::new(RefCell::new(None)),
@@ -960,10 +1065,9 @@ impl ProcessSpec<'_, HydroDeploy> for DeployProcessSpec {
 }
 
 impl ProcessSpec<'_, HydroDeploy> for TrybuildHost {
-    fn build(mut self, id: usize, name_hint: &str) -> DeployNode {
-        self.name_hint = Some(format!("{} (process {id})", name_hint));
+    fn build(mut self, key: LocationKey, name_hint: &str) -> DeployNode {
+        self.name_hint = Some(format!("{} (process {})", name_hint, key));
         DeployNode {
-            id,
             next_port: Rc::new(RefCell::new(0)),
             service_spec: Rc::new(RefCell::new(Some(CrateOrTrybuild::Trybuild(self)))),
             underlying: Rc::new(RefCell::new(None)),
@@ -983,9 +1087,9 @@ impl DeployClusterSpec {
 }
 
 impl ClusterSpec<'_, HydroDeploy> for DeployClusterSpec {
-    fn build(self, id: usize, _name_hint: &str) -> DeployCluster {
+    fn build(self, key: LocationKey, _name_hint: &str) -> DeployCluster {
         DeployCluster {
-            id,
+            key,
             next_port: Rc::new(RefCell::new(0)),
             cluster_spec: Rc::new(RefCell::new(Some(
                 self.0
@@ -1000,10 +1104,10 @@ impl ClusterSpec<'_, HydroDeploy> for DeployClusterSpec {
 }
 
 impl<T: Into<TrybuildHost>, I: IntoIterator<Item = T>> ClusterSpec<'_, HydroDeploy> for I {
-    fn build(self, id: usize, name_hint: &str) -> DeployCluster {
-        let name_hint = format!("{} (cluster {id})", name_hint);
+    fn build(self, key: LocationKey, name_hint: &str) -> DeployCluster {
+        let name_hint = format!("{} (cluster {})", name_hint, key);
         DeployCluster {
-            id,
+            key,
             next_port: Rc::new(RefCell::new(0)),
             cluster_spec: Rc::new(RefCell::new(Some(
                 self.into_iter()
@@ -1024,15 +1128,24 @@ impl<T: Into<TrybuildHost>, I: IntoIterator<Item = T>> ClusterSpec<'_, HydroDepl
 
 fn create_trybuild_service(
     trybuild: TrybuildHost,
-    dir: &std::path::PathBuf,
+    dir: &std::path::Path,
     target_dir: &std::path::PathBuf,
-    features: &Option<Vec<String>>,
+    features: Option<&[String]>,
     bin_name: &str,
+    linking_mode: &LinkingMode,
 ) -> RustCrate {
-    let mut ret = RustCrate::new(dir)
+    // For dynamic linking, use the dylib-examples crate; for static, use the base crate
+    let crate_dir = match linking_mode {
+        LinkingMode::Dynamic => dir.join("dylib-examples"),
+        LinkingMode::Static => dir.to_path_buf(),
+    };
+
+    let mut ret = RustCrate::new(&crate_dir, dir)
         .target_dir(target_dir)
         .example(bin_name)
         .no_default_features();
+
+    ret = ret.set_is_dylib(matches!(linking_mode, LinkingMode::Dynamic));
 
     if let Some(display_name) = trybuild.display_name {
         ret = ret.display_name(display_name);
@@ -1048,12 +1161,16 @@ fn create_trybuild_service(
         ret = ret.rustflags(rustflags);
     }
 
+    if let Some(profile) = trybuild.profile {
+        ret = ret.profile(profile);
+    }
+
     if let Some(tracing) = trybuild.tracing {
         ret = ret.tracing(tracing);
     }
 
     ret = ret.features(
-        vec!["hydro___feature_deploy_integration".to_string()]
+        vec!["hydro___feature_deploy_integration".to_owned()]
             .into_iter()
             .chain(
                 trybuild
@@ -1072,6 +1189,10 @@ fn create_trybuild_service(
 
     for (key, value) in trybuild.build_envs {
         ret = ret.build_env(key, value);
+    }
+
+    for (key, value) in trybuild.env {
+        ret = ret.env(key, value);
     }
 
     ret = ret.build_env("STAGELEFT_TRYBUILD_BUILD_STAGED", "1");

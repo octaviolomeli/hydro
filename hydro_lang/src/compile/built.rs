@@ -1,37 +1,40 @@
-use std::cell::UnsafeCell;
-use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
-use dfir_lang::graph::{DfirGraph, eliminate_extra_unions_tees, partition_graph};
+use dfir_lang::graph::{
+    DfirGraph, FlatGraphBuilderOutput, eliminate_extra_unions_tees, partition_graph,
+};
+use slotmap::{SecondaryMap, SlotMap, SparseSecondaryMap};
 
 use super::compiled::CompiledFlow;
 use super::deploy::{DeployFlow, DeployResult};
 use super::deploy_provider::{ClusterSpec, Deploy, ExternalSpec, IntoProcessSpec};
 use super::ir::{HydroRoot, emit};
-use crate::location::{Cluster, External, Process};
-#[cfg(feature = "sim")]
+use crate::location::{Cluster, External, LocationKey, LocationType, Process};
 #[cfg(stageleft_runtime)]
+#[cfg(feature = "sim")]
 use crate::sim::{flow::SimFlow, graph::SimNode};
 use crate::staging_util::Invariant;
+#[cfg(stageleft_runtime)]
 #[cfg(feature = "viz")]
 use crate::viz::api::GraphApi;
 
 pub struct BuiltFlow<'a> {
     pub(super) ir: Vec<HydroRoot>,
-    pub(super) process_id_name: Vec<(usize, String)>,
-    pub(super) cluster_id_name: Vec<(usize, String)>,
-    pub(super) external_id_name: Vec<(usize, String)>,
+    pub(super) locations: SlotMap<LocationKey, LocationType>,
+    pub(super) location_names: SecondaryMap<LocationKey, String>,
+
+    /// Application name used in telemetry.
+    pub(super) flow_name: String,
 
     pub(super) _phantom: Invariant<'a>,
 }
 
-pub(crate) fn build_inner<'a, D: Deploy<'a>>(
-    ir: &mut Vec<HydroRoot>,
-) -> BTreeMap<usize, DfirGraph> {
-    emit::<D>(ir)
+pub(crate) fn build_inner(ir: &mut Vec<HydroRoot>) -> SecondaryMap<LocationKey, DfirGraph> {
+    emit(ir)
         .into_iter()
         .map(|(k, v)| {
-            let (mut flat_graph, _, _) = v.build();
+            let FlatGraphBuilderOutput { mut flat_graph, .. } =
+                v.build().expect("Failed to build DFIR flat graph.");
             eliminate_extra_unions_tees(&mut flat_graph);
             let partitioned_graph =
                 partition_graph(flat_graph).expect("Failed to partition (cycle detected).");
@@ -41,31 +44,21 @@ pub(crate) fn build_inner<'a, D: Deploy<'a>>(
 }
 
 impl<'a> BuiltFlow<'a> {
-    pub fn ir(&self) -> &Vec<HydroRoot> {
+    /// Returns all [`HydroRoot`]s in the IR.
+    pub fn ir(&self) -> &[HydroRoot] {
         &self.ir
     }
 
-    pub fn process_id_name(&self) -> &Vec<(usize, String)> {
-        &self.process_id_name
-    }
-
-    pub fn cluster_id_name(&self) -> &Vec<(usize, String)> {
-        &self.cluster_id_name
-    }
-
-    pub fn external_id_name(&self) -> &Vec<(usize, String)> {
-        &self.external_id_name
+    /// Returns all raw location ID -> location name mappings.
+    pub fn location_names(&self) -> &SecondaryMap<LocationKey, String> {
+        &self.location_names
     }
 
     /// Get a GraphApi instance for this built flow
+    #[cfg(stageleft_runtime)]
     #[cfg(feature = "viz")]
     pub fn graph_api(&self) -> GraphApi<'_> {
-        GraphApi::new(
-            &self.ir,
-            &self.process_id_name,
-            &self.cluster_id_name,
-            &self.external_id_name,
-        )
+        GraphApi::new(&self.ir, self.location_names())
     }
 
     // String generation methods
@@ -202,13 +195,7 @@ impl<'a> BuiltFlow<'a> {
 
     pub fn optimize_with(mut self, f: impl FnOnce(&mut [HydroRoot])) -> Self {
         f(&mut self.ir);
-        BuiltFlow {
-            ir: std::mem::take(&mut self.ir),
-            process_id_name: std::mem::take(&mut self.process_id_name),
-            cluster_id_name: std::mem::take(&mut self.cluster_id_name),
-            external_id_name: std::mem::take(&mut self.external_id_name),
-            _phantom: PhantomData,
-        }
+        self
     }
 
     pub fn with_default_optimize<D: Deploy<'a>>(self) -> DeployFlow<'a, D> {
@@ -218,107 +205,66 @@ impl<'a> BuiltFlow<'a> {
     #[cfg(feature = "sim")]
     /// Creates a simulation for this builder, which can be used to run deterministic simulations
     /// of the Hydro program.
-    pub fn sim(mut self) -> SimFlow<'a> {
-        use std::cell::{Cell, RefCell};
+    pub fn sim(self) -> SimFlow<'a> {
+        use std::cell::RefCell;
         use std::rc::Rc;
 
-        use crate::sim::graph::SimExternal;
+        use slotmap::SparseSecondaryMap;
 
-        let external_ports = Rc::new(RefCell::new((vec![], 0)));
+        use crate::sim::graph::SimNodePort;
 
-        let global_port_counter = Rc::new(Cell::new(0));
-        let processes = self
-            .process_id_name
-            .iter()
-            .map(|id| {
-                (
-                    id.0,
-                    SimNode {
-                        port_counter: global_port_counter.clone(),
-                    },
-                )
-            })
-            .collect();
+        let shared_port_counter = Rc::new(RefCell::new(SimNodePort::default()));
 
-        let clusters = self
-            .cluster_id_name
-            .iter()
-            .map(|id| {
-                (
-                    id.0,
-                    SimNode {
-                        port_counter: global_port_counter.clone(),
-                    },
-                )
-            })
-            .collect();
+        let mut processes = SparseSecondaryMap::new();
+        let mut clusters = SparseSecondaryMap::new();
+        let externals = SparseSecondaryMap::new();
 
-        let all_external_registered = Rc::new(RefCell::new(HashMap::new()));
-        let externals = self
-            .external_id_name
-            .iter()
-            .map(|id| {
-                (
-                    id.0,
-                    SimExternal {
-                        external_ports: external_ports.clone(),
-                        registered: all_external_registered.clone(),
-                    },
-                )
-            })
-            .collect();
+        for (key, loc) in self.locations.iter() {
+            match loc {
+                LocationType::Process => {
+                    processes.insert(
+                        key,
+                        SimNode {
+                            shared_port_counter: shared_port_counter.clone(),
+                        },
+                    );
+                }
+                LocationType::Cluster => {
+                    clusters.insert(
+                        key,
+                        SimNode {
+                            shared_port_counter: shared_port_counter.clone(),
+                        },
+                    );
+                }
+                LocationType::External => {
+                    panic!("Sim cannot have externals");
+                }
+            }
+        }
 
         SimFlow {
-            ir: std::mem::take(&mut self.ir),
-            external_ports,
+            ir: self.ir,
             processes,
             clusters,
-            cluster_max_sizes: HashMap::new(),
             externals,
-            external_registered: all_external_registered.clone(),
-            _process_id_name: std::mem::take(&mut self.process_id_name),
-            _external_id_name: std::mem::take(&mut self.external_id_name),
-            _cluster_id_name: std::mem::take(&mut self.cluster_id_name),
+            cluster_max_sizes: SparseSecondaryMap::new(),
+            externals_port_registry: Default::default(),
             _phantom: PhantomData,
         }
     }
 
-    pub fn into_deploy<D: Deploy<'a>>(mut self) -> DeployFlow<'a, D> {
-        let processes = if D::has_trivial_node() {
-            self.process_id_name
-                .iter()
-                .map(|id| (id.0, D::trivial_process(id.0)))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-
-        let clusters = if D::has_trivial_node() {
-            self.cluster_id_name
-                .iter()
-                .map(|id| (id.0, D::trivial_cluster(id.0)))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-
-        let externals = if D::has_trivial_node() {
-            self.external_id_name
-                .iter()
-                .map(|id| (id.0, D::trivial_external(id.0)))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-
+    pub fn into_deploy<D: Deploy<'a>>(self) -> DeployFlow<'a, D> {
+        let (processes, clusters, externals) = Default::default();
         DeployFlow {
-            ir: UnsafeCell::new(std::mem::take(&mut self.ir)),
+            ir: self.ir,
+            locations: self.locations,
+            location_names: self.location_names,
             processes,
-            process_id_name: std::mem::take(&mut self.process_id_name),
             clusters,
-            cluster_id_name: std::mem::take(&mut self.cluster_id_name),
             externals,
-            external_id_name: std::mem::take(&mut self.external_id_name),
+            sidecars: SparseSecondaryMap::new(),
+            flow_name: self.flow_name,
             _phantom: PhantomData,
         }
     }
@@ -368,12 +314,8 @@ impl<'a> BuiltFlow<'a> {
         self.into_deploy().with_remaining_clusters(spec)
     }
 
-    pub fn compile<D: Deploy<'a>>(self) -> CompiledFlow<'a, D::GraphId> {
+    pub fn compile<D: Deploy<'a, InstantiateEnv = ()>>(self) -> CompiledFlow<'a> {
         self.into_deploy::<D>().compile()
-    }
-
-    pub fn compile_no_network<D: Deploy<'a>>(self) -> CompiledFlow<'a, D::GraphId> {
-        self.into_deploy::<D>().compile_no_network()
     }
 
     pub fn deploy<D: Deploy<'a>>(self, env: &mut D::InstantiateEnv) -> DeployResult<'a, D> {

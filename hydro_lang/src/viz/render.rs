@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fmt::Write;
+use std::fmt::{Display, Write};
+use std::num::ParseIntError;
+use std::sync::OnceLock;
 
 use auto_impl::auto_impl;
+use slotmap::{Key, SecondaryMap, SlotMap};
 
 pub use super::graphviz::{HydroDot, escape_dot};
 pub use super::json::HydroJson;
@@ -11,6 +14,7 @@ pub use super::mermaid::{HydroMermaid, escape_mermaid};
 use crate::compile::ir::backtrace::Backtrace;
 use crate::compile::ir::{DebugExpr, HydroIrMetadata, HydroNode, HydroRoot, HydroSource};
 use crate::location::dynamic::LocationId;
+use crate::location::{LocationKey, LocationType};
 
 /// Label for a graph node - can be either a static string or contain expressions.
 #[derive(Debug, Clone)]
@@ -36,7 +40,7 @@ impl NodeLabel {
     }
 }
 
-impl std::fmt::Display for NodeLabel {
+impl Display for NodeLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Static(s) => write!(f, "{}", s),
@@ -54,13 +58,13 @@ impl std::fmt::Display for NodeLabel {
 
 /// Base struct for text-based graph writers that use indentation.
 /// Contains common fields shared by DOT and Mermaid writers.
-pub struct IndentedGraphWriter<W> {
+pub struct IndentedGraphWriter<'a, W> {
     pub write: W,
     pub indent: usize,
-    pub config: HydroWriteConfig,
+    pub config: HydroWriteConfig<'a>,
 }
 
-impl<W> IndentedGraphWriter<W> {
+impl<'a, W> IndentedGraphWriter<'a, W> {
     /// Create a new writer with default configuration.
     pub fn new(write: W) -> Self {
         Self {
@@ -71,16 +75,16 @@ impl<W> IndentedGraphWriter<W> {
     }
 
     /// Create a new writer with the given configuration.
-    pub fn new_with_config(write: W, config: &HydroWriteConfig) -> Self {
+    pub fn new_with_config(write: W, config: HydroWriteConfig<'a>) -> Self {
         Self {
             write,
             indent: 0,
-            config: config.clone(),
+            config,
         }
     }
 }
 
-impl<W: Write> IndentedGraphWriter<W> {
+impl<W: Write> IndentedGraphWriter<'_, W> {
     /// Write an indented line using the current indentation level.
     pub fn writeln_indented(&mut self, content: &str) -> Result<(), std::fmt::Error> {
         writeln!(self.write, "{b:i$}{content}", b = "", i = self.indent)
@@ -102,19 +106,19 @@ pub trait HydroGraphWrite {
     /// Write a node definition with styling.
     fn write_node_definition(
         &mut self,
-        node_id: usize,
+        node_id: VizNodeKey,
         node_label: &NodeLabel,
         node_type: HydroNodeType,
-        location_id: Option<usize>,
-        location_type: Option<&str>,
+        location_key: Option<LocationKey>,
+        location_type: Option<LocationType>,
         backtrace: Option<&Backtrace>,
     ) -> Result<(), Self::Err>;
 
     /// Write an edge between nodes with optional labeling.
     fn write_edge(
         &mut self,
-        src_id: usize,
-        dst_id: usize,
+        src_id: VizNodeKey,
+        dst_id: VizNodeKey,
         edge_properties: &HashSet<HydroEdgeProp>,
         label: Option<&str>,
     ) -> Result<(), Self::Err>;
@@ -122,12 +126,12 @@ pub trait HydroGraphWrite {
     /// Begin writing a location grouping (process/cluster).
     fn write_location_start(
         &mut self,
-        location_id: usize,
-        location_type: &str,
+        location_key: LocationKey,
+        location_type: LocationType,
     ) -> Result<(), Self::Err>;
 
     /// Write a node within a location.
-    fn write_node(&mut self, node_id: usize) -> Result<(), Self::Err>;
+    fn write_node(&mut self, node_id: VizNodeKey) -> Result<(), Self::Err>;
 
     /// End writing a location grouping.
     fn write_location_end(&mut self) -> Result<(), Self::Err>;
@@ -467,25 +471,22 @@ pub fn add_network_edge_tag(
 }
 
 /// Configuration for graph writing.
-#[derive(Debug, Clone)]
-pub struct HydroWriteConfig {
+#[derive(Debug, Clone, Copy)]
+pub struct HydroWriteConfig<'a> {
     pub show_metadata: bool,
     pub show_location_groups: bool,
     pub use_short_labels: bool,
-    pub process_id_name: Vec<(usize, String)>,
-    pub cluster_id_name: Vec<(usize, String)>,
-    pub external_id_name: Vec<(usize, String)>,
+    pub location_names: &'a SecondaryMap<LocationKey, String>,
 }
 
-impl Default for HydroWriteConfig {
+impl Default for HydroWriteConfig<'_> {
     fn default() -> Self {
+        static EMPTY: OnceLock<SecondaryMap<LocationKey, String>> = OnceLock::new();
         Self {
             show_metadata: false,
             show_location_groups: true,
             use_short_labels: true, // Default to short labels for all renderers
-            process_id_name: vec![],
-            cluster_id_name: vec![],
-            external_id_name: vec![],
+            location_names: EMPTY.get_or_init(SecondaryMap::new),
         }
     }
 }
@@ -495,15 +496,52 @@ impl Default for HydroWriteConfig {
 pub struct HydroGraphNode {
     pub label: NodeLabel,
     pub node_type: HydroNodeType,
-    pub location: Option<usize>,
+    pub location_key: Option<LocationKey>,
     pub backtrace: Option<Backtrace>,
+}
+
+slotmap::new_key_type! {
+    /// Unique identifier for nodes in the visualization graph.
+    ///
+    /// This is counted/allocated separately from any other IDs within `hydro_lang`.
+    pub struct VizNodeKey;
+}
+
+impl Display for VizNodeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "viz{:?}", self.data()) // `"viz1v1"``
+    }
+}
+
+/// This is used by the visualizer
+/// TODO(mingwei): Make this more robust?
+impl std::str::FromStr for VizNodeKey {
+    type Err = Option<ParseIntError>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let nvn = s.strip_prefix("viz").ok_or(None)?;
+        let (idx, ver) = nvn.split_once("v").ok_or(None)?;
+        let idx: u64 = idx.parse()?;
+        let ver: u64 = ver.parse()?;
+        Ok(slotmap::KeyData::from_ffi((ver << 32) | idx).into())
+    }
+}
+
+impl VizNodeKey {
+    /// A key for testing with index 1.
+    #[cfg(test)]
+    pub const TEST_KEY_1: Self = Self(slotmap::KeyData::from_ffi(0x0000008f00000001)); // `1v143`
+
+    /// A key for testing with index 2.
+    #[cfg(test)]
+    pub const TEST_KEY_2: Self = Self(slotmap::KeyData::from_ffi(0x0000008f00000002)); // `2v143`
 }
 
 /// Edge information in the Hydro graph.
 #[derive(Debug, Clone)]
 pub struct HydroGraphEdge {
-    pub src: usize,
-    pub dst: usize,
+    pub src: VizNodeKey,
+    pub dst: VizNodeKey,
     pub edge_properties: HashSet<HydroEdgeProp>,
     pub label: Option<String>,
 }
@@ -511,10 +549,9 @@ pub struct HydroGraphEdge {
 /// Graph structure tracker for Hydro IR rendering.
 #[derive(Default)]
 pub struct HydroGraphStructure {
-    pub nodes: HashMap<usize, HydroGraphNode>,
+    pub nodes: SlotMap<VizNodeKey, HydroGraphNode>,
     pub edges: Vec<HydroGraphEdge>,
-    pub locations: HashMap<usize, String>, // location_id -> location_type
-    pub next_node_id: usize,
+    pub locations: SecondaryMap<LocationKey, LocationType>,
 }
 
 impl HydroGraphStructure {
@@ -526,30 +563,24 @@ impl HydroGraphStructure {
         &mut self,
         label: NodeLabel,
         node_type: HydroNodeType,
-        location: Option<usize>,
-    ) -> usize {
-        self.add_node_with_backtrace(label, node_type, location, None)
+        location_key: Option<LocationKey>,
+    ) -> VizNodeKey {
+        self.add_node_with_backtrace(label, node_type, location_key, None)
     }
 
     pub fn add_node_with_backtrace(
         &mut self,
         label: NodeLabel,
         node_type: HydroNodeType,
-        location: Option<usize>,
+        location_key: Option<LocationKey>,
         backtrace: Option<Backtrace>,
-    ) -> usize {
-        let node_id = self.next_node_id;
-        self.next_node_id += 1;
-        self.nodes.insert(
-            node_id,
-            HydroGraphNode {
-                label,
-                node_type,
-                location,
-                backtrace,
-            },
-        );
-        node_id
+    ) -> VizNodeKey {
+        self.nodes.insert(HydroGraphNode {
+            label,
+            node_type,
+            location_key,
+            backtrace,
+        })
     }
 
     /// Add a node with metadata, extracting backtrace automatically
@@ -558,16 +589,16 @@ impl HydroGraphStructure {
         label: NodeLabel,
         node_type: HydroNodeType,
         metadata: &HydroIrMetadata,
-    ) -> usize {
-        let location = setup_location(self, metadata);
+    ) -> VizNodeKey {
+        let location_key = Some(setup_location(self, metadata));
         let backtrace = Some(metadata.op.backtrace.clone());
-        self.add_node_with_backtrace(label, node_type, location, backtrace)
+        self.add_node_with_backtrace(label, node_type, location_key, backtrace)
     }
 
     pub fn add_edge(
         &mut self,
-        src: usize,
-        dst: usize,
+        src: VizNodeKey,
+        dst: VizNodeKey,
         edge_properties: HashSet<HydroEdgeProp>,
         label: Option<String>,
     ) {
@@ -582,8 +613,8 @@ impl HydroGraphStructure {
     // Legacy method for backward compatibility
     pub fn add_edge_single(
         &mut self,
-        src: usize,
-        dst: usize,
+        src: VizNodeKey,
+        dst: VizNodeKey,
         edge_type: HydroEdgeProp,
         label: Option<String>,
     ) {
@@ -597,8 +628,8 @@ impl HydroGraphStructure {
         });
     }
 
-    pub fn add_location(&mut self, location_id: usize, location_type: String) {
-        self.locations.insert(location_id, location_type);
+    pub fn add_location(&mut self, location_key: LocationKey, location_type: LocationType) {
+        self.locations.insert(location_key, location_type);
     }
 }
 
@@ -608,7 +639,6 @@ pub fn extract_op_name(full_label: String) -> String {
         .split('(')
         .next()
         .unwrap_or("unknown")
-        .to_string()
         .to_lowercase()
 }
 
@@ -621,24 +651,24 @@ pub fn extract_short_label(full_label: &str) -> String {
             // Handle special cases for UI display
             "source" => {
                 if full_label.contains("Iter") {
-                    "source_iter".to_string()
+                    "source_iter".to_owned()
                 } else if full_label.contains("Stream") {
-                    "source_stream".to_string()
+                    "source_stream".to_owned()
                 } else if full_label.contains("ExternalNetwork") {
-                    "external_network".to_string()
+                    "external_network".to_owned()
                 } else if full_label.contains("Spin") {
-                    "spin".to_string()
+                    "spin".to_owned()
                 } else {
-                    "source".to_string()
+                    "source".to_owned()
                 }
             }
             "network" => {
                 if full_label.contains("deser") {
-                    "network(recv)".to_string()
+                    "network(recv)".to_owned()
                 } else if full_label.contains("ser") {
-                    "network(send)".to_string()
+                    "network(send)".to_owned()
                 } else {
-                    "network".to_string()
+                    "network".to_owned()
                 }
             }
             // For all other cases, just use the lowercase base name (same as extract_op_name)
@@ -649,38 +679,26 @@ pub fn extract_short_label(full_label: &str) -> String {
         if full_label.len() > 20 {
             format!("{}...", &full_label[..17])
         } else {
-            full_label.to_string()
+            full_label.to_owned()
         }
     }
 }
 
-/// Helper function to extract location ID and type from metadata.
-fn extract_location_id(location_id: &LocationId) -> (Option<usize>, Option<String>) {
-    match location_id.root() {
-        LocationId::Process(id) => (Some(*id), Some("Process".to_string())),
-        LocationId::Cluster(id) => (Some(*id), Some("Cluster".to_string())),
-        _ => panic!("unexpected location type"),
-    }
-}
-
 /// Helper function to set up location in structure from metadata.
-fn setup_location(
-    structure: &mut HydroGraphStructure,
-    metadata: &HydroIrMetadata,
-) -> Option<usize> {
-    let (location_id, location_type) = extract_location_id(&metadata.location_kind);
-    if let (Some(loc_id), Some(loc_type)) = (location_id, location_type) {
-        structure.add_location(loc_id, loc_type);
-    }
-    location_id
+fn setup_location(structure: &mut HydroGraphStructure, metadata: &HydroIrMetadata) -> LocationKey {
+    let root = metadata.location_id.root();
+    let location_key = root.key();
+    let location_type = root.location_type().unwrap();
+    structure.add_location(location_key, location_type);
+    location_key
 }
 
 /// Helper function to add an edge with semantic tags extracted from metadata.
 /// This function combines collection kind extraction with network detection.
 fn add_edge_with_metadata(
     structure: &mut HydroGraphStructure,
-    src_id: usize,
-    dst_id: usize,
+    src_id: VizNodeKey,
+    dst_id: VizNodeKey,
     src_metadata: Option<&HydroIrMetadata>,
     dst_metadata: Option<&HydroIrMetadata>,
     label: Option<String>,
@@ -698,8 +716,8 @@ fn add_edge_with_metadata(
     if let (Some(src_meta), Some(dst_meta)) = (src_metadata, dst_metadata) {
         add_network_edge_tag(
             &mut properties,
-            &src_meta.location_kind,
-            &dst_meta.location_kind,
+            &src_meta.location_id,
+            &dst_meta.location_id,
         );
     }
 
@@ -715,7 +733,7 @@ fn add_edge_with_metadata(
 fn write_graph_structure<W>(
     structure: &HydroGraphStructure,
     graph_write: W,
-    config: &HydroWriteConfig,
+    config: HydroWriteConfig<'_>,
 ) -> Result<(), W::Err>
 where
     W: HydroGraphWrite,
@@ -725,21 +743,17 @@ where
     graph_write.write_prologue()?;
 
     // Write node definitions
-    for (&node_id, node) in &structure.nodes {
-        let (location_id, location_type) = if let Some(loc_id) = node.location {
-            (
-                Some(loc_id),
-                structure.locations.get(&loc_id).map(|s| s.as_str()),
-            )
-        } else {
-            (None, None)
-        };
+    for (node_id, node) in structure.nodes.iter() {
+        let location_type = node
+            .location_key
+            .and_then(|loc_key| structure.locations.get(loc_key))
+            .copied();
 
         graph_write.write_node_definition(
             node_id,
             &node.label,
             node.node_type,
-            location_id,
+            node.location_key,
             location_type,
             node.backtrace.as_ref(),
         )?;
@@ -747,20 +761,21 @@ where
 
     // Group nodes by location if requested
     if config.show_location_groups {
-        let mut nodes_by_location: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (&node_id, node) in &structure.nodes {
-            if let Some(location_id) = node.location {
+        let mut nodes_by_location = SecondaryMap::<LocationKey, Vec<VizNodeKey>>::new();
+        for (node_id, node) in structure.nodes.iter() {
+            if let Some(location_key) = node.location_key {
                 nodes_by_location
-                    .entry(location_id)
+                    .entry(location_key)
+                    .expect("location was removed")
                     .or_default()
                     .push(node_id);
             }
         }
 
-        for (&location_id, node_ids) in &nodes_by_location {
-            if let Some(location_type) = structure.locations.get(&location_id) {
-                graph_write.write_location_start(location_id, location_type)?;
-                for &node_id in node_ids {
+        for (location_key, node_ids) in nodes_by_location.iter() {
+            if let Some(&location_type) = structure.locations.get(location_key) {
+                graph_write.write_location_start(location_key, location_type)?;
+                for &node_id in node_ids.iter() {
                     graph_write.write_node(node_id)?;
                 }
                 graph_write.write_location_end()?;
@@ -769,7 +784,7 @@ where
     }
 
     // Write edges
-    for edge in &structure.edges {
+    for edge in structure.edges.iter() {
         graph_write.write_edge(
             edge.src,
             edge.dst,
@@ -787,18 +802,18 @@ impl HydroRoot {
     pub fn build_graph_structure(
         &self,
         structure: &mut HydroGraphStructure,
-        seen_tees: &mut HashMap<*const std::cell::RefCell<HydroNode>, usize>,
-        config: &HydroWriteConfig,
-    ) -> usize {
+        seen_tees: &mut HashMap<*const std::cell::RefCell<HydroNode>, VizNodeKey>,
+        config: HydroWriteConfig<'_>,
+    ) -> VizNodeKey {
         // Helper function for sink nodes to reduce duplication
         fn build_sink_node(
             structure: &mut HydroGraphStructure,
-            seen_tees: &mut HashMap<*const std::cell::RefCell<HydroNode>, usize>,
-            config: &HydroWriteConfig,
+            seen_tees: &mut HashMap<*const std::cell::RefCell<HydroNode>, VizNodeKey>,
+            config: HydroWriteConfig<'_>,
             input: &HydroNode,
             sink_metadata: Option<&HydroIrMetadata>,
             label: NodeLabel,
-        ) -> usize {
+        ) -> VizNodeKey {
             let input_id = input.build_graph_structure(structure, seen_tees, config);
 
             // If no explicit metadata is provided, extract it from the input node
@@ -812,11 +827,11 @@ impl HydroRoot {
                 }
             };
 
-            let location_id = effective_metadata.and_then(|m| setup_location(structure, m));
+            let location_key = effective_metadata.map(|m| setup_location(structure, m));
             let sink_id = structure.add_node_with_backtrace(
                 label,
                 HydroNodeType::Sink,
-                location_id,
+                location_key,
                 effective_metadata.map(|m| m.op.backtrace.clone()),
             );
 
@@ -842,12 +857,12 @@ impl HydroRoot {
                 config,
                 input,
                 None,
-                NodeLabel::with_exprs("for_each".to_string(), vec![f.clone()]),
+                NodeLabel::with_exprs("for_each".to_owned(), vec![f.clone()]),
             ),
 
             HydroRoot::SendExternal {
-                to_external_id,
-                to_key,
+                to_external_key,
+                to_port_id,
                 input,
                 ..
             } => build_sink_node(
@@ -857,7 +872,7 @@ impl HydroRoot {
                 input,
                 None,
                 NodeLabel::with_exprs(
-                    format!("send_external({}:{})", to_external_id, to_key),
+                    format!("send_external({}:{})", to_external_key, to_port_id),
                     vec![],
                 ),
             ),
@@ -868,16 +883,27 @@ impl HydroRoot {
                 config,
                 input,
                 None,
-                NodeLabel::with_exprs("dest_sink".to_string(), vec![sink.clone()]),
+                NodeLabel::with_exprs("dest_sink".to_owned(), vec![sink.clone()]),
             ),
 
-            HydroRoot::CycleSink { ident, input, .. } => build_sink_node(
+            HydroRoot::CycleSink {
+                cycle_id, input, ..
+            } => build_sink_node(
                 structure,
                 seen_tees,
                 config,
                 input,
                 None,
-                NodeLabel::static_label(format!("cycle_sink({})", ident)),
+                NodeLabel::static_label(format!("cycle_sink({})", cycle_id)),
+            ),
+
+            HydroRoot::EmbeddedOutput { ident, input, .. } => build_sink_node(
+                structure,
+                seen_tees,
+                config,
+                input,
+                None,
+                NodeLabel::static_label(format!("embedded_output({})", ident)),
             ),
         }
     }
@@ -888,18 +914,16 @@ impl HydroNode {
     pub fn build_graph_structure(
         &self,
         structure: &mut HydroGraphStructure,
-        seen_tees: &mut HashMap<*const std::cell::RefCell<HydroNode>, usize>,
-        config: &HydroWriteConfig,
-    ) -> usize {
-        use crate::location::dynamic::LocationId;
-
+        seen_tees: &mut HashMap<*const std::cell::RefCell<HydroNode>, VizNodeKey>,
+        config: HydroWriteConfig<'_>,
+    ) -> VizNodeKey {
         // Helper functions to reduce duplication, categorized by input/expression patterns
 
         /// Common parameters for transform builder functions to reduce argument count
         struct TransformParams<'a> {
             structure: &'a mut HydroGraphStructure,
-            seen_tees: &'a mut HashMap<*const std::cell::RefCell<HydroNode>, usize>,
-            config: &'a HydroWriteConfig,
+            seen_tees: &'a mut HashMap<*const std::cell::RefCell<HydroNode>, VizNodeKey>,
+            config: HydroWriteConfig<'a>,
             input: &'a HydroNode,
             metadata: &'a HydroIrMetadata,
             op_name: String,
@@ -907,7 +931,7 @@ impl HydroNode {
         }
 
         // Single-input transform with no expressions
-        fn build_simple_transform(params: TransformParams) -> usize {
+        fn build_simple_transform(params: TransformParams) -> VizNodeKey {
             let input_id = params.input.build_graph_structure(
                 params.structure,
                 params.seen_tees,
@@ -934,7 +958,7 @@ impl HydroNode {
         }
 
         // Single-input transform with one expression
-        fn build_single_expr_transform(params: TransformParams, expr: &DebugExpr) -> usize {
+        fn build_single_expr_transform(params: TransformParams, expr: &DebugExpr) -> VizNodeKey {
             let input_id = params.input.build_graph_structure(
                 params.structure,
                 params.seen_tees,
@@ -965,7 +989,7 @@ impl HydroNode {
             params: TransformParams,
             expr1: &DebugExpr,
             expr2: &DebugExpr,
-        ) -> usize {
+        ) -> VizNodeKey {
             let input_id = params.input.build_graph_structure(
                 params.structure,
                 params.seen_tees,
@@ -999,7 +1023,7 @@ impl HydroNode {
             structure: &mut HydroGraphStructure,
             metadata: &HydroIrMetadata,
             label: String,
-        ) -> usize {
+        ) -> VizNodeKey {
             structure.add_node_with_metadata(
                 NodeLabel::Static(label),
                 HydroNodeType::Source,
@@ -1009,7 +1033,7 @@ impl HydroNode {
 
         match self {
             HydroNode::Placeholder => structure.add_node(
-                NodeLabel::Static("PLACEHOLDER".to_string()),
+                NodeLabel::Static("PLACEHOLDER".to_owned()),
                 HydroNodeType::Transform,
                 None,
             ),
@@ -1019,14 +1043,17 @@ impl HydroNode {
             } => {
                 let label = match source {
                     HydroSource::Stream(expr) => format!("source_stream({})", expr),
-                    HydroSource::ExternalNetwork() => "external_network()".to_string(),
+                    HydroSource::ExternalNetwork() => "external_network()".to_owned(),
                     HydroSource::Iter(expr) => format!("source_iter({})", expr),
-                    HydroSource::Spin() => "spin()".to_string(),
-                    HydroSource::ClusterMembers(location_id) => {
+                    HydroSource::Spin() => "spin()".to_owned(),
+                    HydroSource::ClusterMembers(location_id, _) => {
                         format!(
                             "source_stream(cluster_membership_stream({:?}))",
                             location_id
                         )
+                    }
+                    HydroSource::Embedded(ident) => {
+                        format!("embedded_input({})", ident)
                     }
                 };
                 build_source_node(structure, metadata, label)
@@ -1038,19 +1065,19 @@ impl HydroNode {
             }
 
             HydroNode::ExternalInput {
-                from_external_id,
-                from_key,
+                from_external_key,
+                from_port_id,
                 metadata,
                 ..
             } => build_source_node(
                 structure,
                 metadata,
-                format!("external_input({}:{})", from_external_id, from_key),
+                format!("external_input({}:{})", from_external_key, from_port_id),
             ),
 
             HydroNode::CycleSource {
-                ident, metadata, ..
-            } => build_source_node(structure, metadata, format!("cycle_source({})", ident)),
+                cycle_id, metadata, ..
+            } => build_source_node(structure, metadata, format!("cycle_source({})", cycle_id)),
 
             HydroNode::Tee { inner, metadata } => {
                 let ptr = inner.as_ptr();
@@ -1210,7 +1237,7 @@ impl HydroNode {
                     node_id,
                     Some(left_metadata),
                     Some(metadata),
-                    Some("left".to_string()),
+                    Some("left".to_owned()),
                 );
 
                 // Extract semantic tags for right edge
@@ -1221,7 +1248,7 @@ impl HydroNode {
                     node_id,
                     Some(right_metadata),
                     Some(metadata),
-                    Some("right".to_string()),
+                    Some("right".to_owned()),
                 );
 
                 node_id
@@ -1254,7 +1281,7 @@ impl HydroNode {
                     node_id,
                     Some(left_metadata),
                     Some(metadata),
-                    Some("pos".to_string()),
+                    Some("pos".to_owned()),
                 );
 
                 // Extract semantic tags for neg edge
@@ -1265,7 +1292,7 @@ impl HydroNode {
                     node_id,
                     Some(right_metadata),
                     Some(metadata),
-                    Some("neg".to_string()),
+                    Some("neg".to_owned()),
                 );
 
                 node_id
@@ -1316,11 +1343,11 @@ impl HydroNode {
             } => {
                 let input_id = input.build_graph_structure(structure, seen_tees, config);
                 let watermark_id = watermark.build_graph_structure(structure, seen_tees, config);
-                let location_id = setup_location(structure, metadata);
+                let location_key = Some(setup_location(structure, metadata));
                 let join_node_id = structure.add_node_with_backtrace(
                     NodeLabel::Static(extract_op_name(self.print_root())),
                     HydroNodeType::Join,
-                    location_id,
+                    location_key,
                     Some(metadata.op.backtrace.clone()),
                 );
 
@@ -1332,7 +1359,7 @@ impl HydroNode {
                     join_node_id,
                     Some(input_metadata),
                     Some(metadata),
-                    Some("input".to_string()),
+                    Some("input".to_owned()),
                 );
 
                 // Extract semantic tags for watermark edge
@@ -1343,16 +1370,13 @@ impl HydroNode {
                     join_node_id,
                     Some(watermark_metadata),
                     Some(metadata),
-                    Some("watermark".to_string()),
+                    Some("watermark".to_owned()),
                 );
 
                 let node_id = structure.add_node_with_backtrace(
-                    NodeLabel::with_exprs(
-                        extract_op_name(self.print_root()).to_string(),
-                        vec![f.clone()],
-                    ),
+                    NodeLabel::with_exprs(extract_op_name(self.print_root()), vec![f.clone()]),
                     HydroNodeType::Aggregation,
-                    location_id,
+                    location_key,
                     Some(metadata.op.backtrace.clone()),
                 );
 
@@ -1378,21 +1402,14 @@ impl HydroNode {
                 ..
             } => {
                 let input_id = input.build_graph_structure(structure, seen_tees, config);
-                let _from_location_id = setup_location(structure, metadata);
+                let _from_location_key = setup_location(structure, metadata);
 
-                let to_location_id = match metadata.location_kind.root() {
-                    LocationId::Process(id) => {
-                        structure.add_location(*id, "Process".to_string());
-                        Some(*id)
-                    }
-                    LocationId::Cluster(id) => {
-                        structure.add_location(*id, "Cluster".to_string());
-                        Some(*id)
-                    }
-                    _ => None,
-                };
+                let root = metadata.location_id.root();
+                let to_location_key = root.key();
+                let to_location_type = root.location_type().unwrap();
+                structure.add_location(to_location_key, to_location_type);
 
-                let mut label = "network(".to_string();
+                let mut label = "network(".to_owned();
                 if serialize_fn.is_some() {
                     label.push_str("send");
                 }
@@ -1407,7 +1424,7 @@ impl HydroNode {
                 let network_id = structure.add_node_with_backtrace(
                     NodeLabel::Static(label),
                     HydroNodeType::Network,
-                    to_location_id,
+                    Some(to_location_key),
                     Some(metadata.op.backtrace.clone()),
                 );
 
@@ -1419,7 +1436,7 @@ impl HydroNode {
                     network_id,
                     Some(input_metadata),
                     Some(metadata),
-                    Some(format!("to {:?}", to_location_id)),
+                    Some(format!("to {:?}({})", to_location_type, to_location_key)),
                 );
 
                 network_id
@@ -1456,11 +1473,11 @@ impl HydroNode {
             } => {
                 let first_id = first.build_graph_structure(structure, seen_tees, config);
                 let second_id = second.build_graph_structure(structure, seen_tees, config);
-                let location_id = setup_location(structure, metadata);
+                let location_key = Some(setup_location(structure, metadata));
                 let chain_id = structure.add_node_with_backtrace(
                     NodeLabel::Static(extract_op_name(self.print_root())),
                     HydroNodeType::Transform,
-                    location_id,
+                    location_key,
                     Some(metadata.op.backtrace.clone()),
                 );
 
@@ -1472,7 +1489,7 @@ impl HydroNode {
                     chain_id,
                     Some(first_metadata),
                     Some(metadata),
-                    Some("first".to_string()),
+                    Some("first".to_owned()),
                 );
 
                 // Extract semantic tags for second edge
@@ -1483,7 +1500,7 @@ impl HydroNode {
                     chain_id,
                     Some(second_metadata),
                     Some(metadata),
-                    Some("second".to_string()),
+                    Some("second".to_owned()),
                 );
 
                 chain_id
@@ -1496,11 +1513,11 @@ impl HydroNode {
             } => {
                 let first_id = first.build_graph_structure(structure, seen_tees, config);
                 let second_id = second.build_graph_structure(structure, seen_tees, config);
-                let location_id = setup_location(structure, metadata);
+                let location_key = Some(setup_location(structure, metadata));
                 let chain_id = structure.add_node_with_backtrace(
                     NodeLabel::Static(extract_op_name(self.print_root())),
                     HydroNodeType::Transform,
-                    location_id,
+                    location_key,
                     Some(metadata.op.backtrace.clone()),
                 );
 
@@ -1512,7 +1529,7 @@ impl HydroNode {
                     chain_id,
                     Some(first_metadata),
                     Some(metadata),
-                    Some("first".to_string()),
+                    Some("first".to_owned()),
                 );
 
                 // Extract semantic tags for second edge
@@ -1523,7 +1540,7 @@ impl HydroNode {
                     chain_id,
                     Some(second_metadata),
                     Some(metadata),
-                    Some("second".to_string()),
+                    Some("second".to_owned()),
                 );
 
                 chain_id
@@ -1555,7 +1572,7 @@ impl HydroNode {
 /// Macro to reduce duplication in render functions.
 macro_rules! render_hydro_ir {
     ($name:ident, $write_fn:ident) => {
-        pub fn $name(roots: &[HydroRoot], config: &HydroWriteConfig) -> String {
+        pub fn $name(roots: &[HydroRoot], config: HydroWriteConfig<'_>) -> String {
             let mut output = String::new();
             $write_fn(&mut output, roots, config).unwrap();
             output
@@ -1569,7 +1586,7 @@ macro_rules! write_hydro_ir {
         pub fn $name(
             output: impl std::fmt::Write,
             roots: &[HydroRoot],
-            config: &HydroWriteConfig,
+            config: HydroWriteConfig<'_>,
         ) -> std::fmt::Result {
             let mut graph_write: $writer_type = $constructor(output, config);
             write_hydro_ir_graph(&mut graph_write, roots, config)
@@ -1597,7 +1614,7 @@ write_hydro_ir!(write_hydro_ir_json, HydroJson<_>, HydroJson::new);
 fn write_hydro_ir_graph<W>(
     graph_write: W,
     roots: &[HydroRoot],
-    config: &HydroWriteConfig,
+    config: HydroWriteConfig<'_>,
 ) -> Result<(), W::Err>
 where
     W: HydroGraphWrite,

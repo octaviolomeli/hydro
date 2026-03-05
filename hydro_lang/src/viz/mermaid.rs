@@ -1,7 +1,11 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
-use super::render::{HydroEdgeProp, HydroGraphWrite, HydroNodeType, IndentedGraphWriter};
+use super::render::{
+    HydroEdgeProp, HydroGraphWrite, HydroNodeType, HydroWriteConfig, IndentedGraphWriter,
+};
+use crate::location::{LocationKey, LocationType};
+use crate::viz::render::VizNodeKey;
 
 /// Escapes a string for use in a mermaid graph label.
 pub fn escape_mermaid(string: &str) -> String {
@@ -22,12 +26,12 @@ pub fn escape_mermaid(string: &str) -> String {
 }
 
 /// Mermaid graph writer for Hydro IR.
-pub struct HydroMermaid<W> {
-    base: IndentedGraphWriter<W>,
+pub struct HydroMermaid<'a, W> {
+    base: IndentedGraphWriter<'a, W>,
     link_count: usize,
 }
 
-impl<W> HydroMermaid<W> {
+impl<'a, W> HydroMermaid<'a, W> {
     pub fn new(write: W) -> Self {
         Self {
             base: IndentedGraphWriter::new(write),
@@ -35,7 +39,7 @@ impl<W> HydroMermaid<W> {
         }
     }
 
-    pub fn new_with_config(write: W, config: &super::render::HydroWriteConfig) -> Self {
+    pub fn new_with_config(write: W, config: HydroWriteConfig<'a>) -> Self {
         Self {
             base: IndentedGraphWriter::new_with_config(write, config),
             link_count: 0,
@@ -43,7 +47,7 @@ impl<W> HydroMermaid<W> {
     }
 }
 
-impl<W> HydroGraphWrite for HydroMermaid<W>
+impl<W> HydroGraphWrite for HydroMermaid<'_, W>
 where
     W: Write,
 {
@@ -71,11 +75,11 @@ where
 
     fn write_node_definition(
         &mut self,
-        node_id: usize,
+        node_id: VizNodeKey,
         node_label: &super::render::NodeLabel,
         node_type: HydroNodeType,
-        _location_id: Option<usize>,
-        _location_type: Option<&str>,
+        _location_id: Option<LocationKey>,
+        _location_type: Option<LocationType>,
         _backtrace: Option<&crate::compile::ir::backtrace::Backtrace>,
     ) -> Result<(), Self::Err> {
         let class_str = match node_type {
@@ -135,8 +139,8 @@ where
 
     fn write_edge(
         &mut self,
-        src_id: usize,
-        dst_id: usize,
+        src_id: VizNodeKey,
+        dst_id: VizNodeKey,
         edge_properties: &std::collections::HashSet<HydroEdgeProp>,
         label: Option<&str>,
     ) -> Result<(), Self::Err> {
@@ -145,16 +149,16 @@ where
 
         // Determine arrow style based on edge properties
         let arrow_style = if edge_properties.contains(&HydroEdgeProp::Network) {
-            "-.->".to_string()
+            "-.->".to_owned()
         } else {
             match style.line_pattern {
-                super::render::LinePattern::Dotted => "-.->".to_string(),
-                super::render::LinePattern::Dashed => "--o".to_string(),
+                super::render::LinePattern::Dotted => "-.->".to_owned(),
+                super::render::LinePattern::Dashed => "--o".to_owned(),
                 _ => {
                     if style.line_width > 1 {
-                        "==>".to_string()
+                        "==>".to_owned()
                     } else {
-                        "-->".to_string()
+                        "-->".to_owned()
                     }
                 }
             }
@@ -192,13 +196,13 @@ where
 
     fn write_location_start(
         &mut self,
-        location_id: usize,
-        location_type: &str,
+        location_key: LocationKey,
+        location_type: LocationType,
     ) -> Result<(), Self::Err> {
         writeln!(
             self.base.write,
-            "{b:i$}subgraph loc_{id} [\"{location_type} {id}\"]",
-            id = location_id,
+            "{b:i$}subgraph {loc} [\"{location_type:?} {loc}\"]",
+            loc = location_key,
             b = "",
             i = self.base.indent,
         )?;
@@ -206,7 +210,7 @@ where
         Ok(())
     }
 
-    fn write_node(&mut self, node_id: usize) -> Result<(), Self::Err> {
+    fn write_node(&mut self, node_id: VizNodeKey) -> Result<(), Self::Err> {
         writeln!(
             self.base.write,
             "{b:i$}n{node_id}",
@@ -230,13 +234,11 @@ where
 pub fn open_browser(
     built_flow: &crate::compile::built::BuiltFlow,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = super::render::HydroWriteConfig {
+    let config = HydroWriteConfig {
         show_metadata: false,
         show_location_groups: true,
         use_short_labels: true, // Default to short labels
-        process_id_name: built_flow.process_id_name().clone(),
-        cluster_id_name: built_flow.cluster_id_name().clone(),
-        external_id_name: built_flow.external_id_name().clone(),
+        location_names: built_flow.location_names(),
     };
 
     // Use the existing debug function

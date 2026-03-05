@@ -13,10 +13,12 @@ use tokio::sync::{OnceCell, RwLock, mpsc};
 use super::build::{BuildError, BuildOutput, BuildParams, build_crate_memoized};
 use super::ports::{self, RustCratePortConfig};
 use super::tracing_options::TracingOptions;
+#[cfg(feature = "profile-folding")]
+use crate::TracingResults;
 use crate::progress::ProgressTracker;
 use crate::{
     BaseServerStrategy, Host, LaunchedBinary, LaunchedHost, PortNetworkHint, ResourceBatch,
-    ResourceResult, ServerStrategy, Service, TracingResults,
+    ResourceResult, ServerStrategy, Service,
 };
 
 pub struct RustCrateService {
@@ -27,6 +29,7 @@ pub struct RustCrateService {
     args: Option<Vec<String>>,
     display_id: Option<String>,
     external_ports: Vec<u16>,
+    env: HashMap<String, String>,
 
     meta: OnceLock<String>,
 
@@ -47,6 +50,7 @@ pub struct RustCrateService {
 }
 
 impl RustCrateService {
+    #[expect(clippy::too_many_arguments, reason = "internal use")]
     pub fn new(
         id: usize,
         on: Arc<dyn Host>,
@@ -55,6 +59,7 @@ impl RustCrateService {
         args: Option<Vec<String>>,
         display_id: Option<String>,
         external_ports: Vec<u16>,
+        env: HashMap<String, String>,
     ) -> Self {
         Self {
             id,
@@ -64,6 +69,7 @@ impl RustCrateService {
             args,
             display_id,
             external_ports,
+            env,
             meta: OnceLock::new(),
             port_to_server: MemoMap::new(),
             port_to_bind: MemoMap::new(),
@@ -125,6 +131,7 @@ impl RustCrateService {
         self.launched_binary.get().unwrap().stderr_filter(prefix)
     }
 
+    #[cfg(feature = "profile-folding")]
     pub fn tracing_results(&self) -> Option<&TracingResults> {
         self.launched_binary.get().unwrap().tracing_results()
     }
@@ -207,6 +214,7 @@ impl Service for RustCrateService {
                                 built,
                                 &args,
                                 self.tracing.clone(),
+                                &self.env,
                             )
                             .await?;
 
@@ -302,7 +310,7 @@ impl Service for RustCrateService {
             None,
             || async {
                 let launched_binary = self.launched_binary.get().unwrap();
-                launched_binary.stdin().send("stop\n".to_string())?;
+                launched_binary.stdin().send("stop\n".to_owned())?;
 
                 let timeout_result = ProgressTracker::leaf(
                     "waiting for exit",

@@ -23,7 +23,7 @@ pub fn sharded_counter_service<'a>(
             key.hash(&mut hasher);
             MemberId::from_raw_id(hasher.finish() as u32 % 5)
         }))
-        .demux_bincode(shard_servers);
+        .demux(shard_servers, TCP.fail_stop().bincode());
 
     let sharded_get_requests = get_requests
         .prefix_key(q!(|(_client, key)| {
@@ -31,16 +31,20 @@ pub fn sharded_counter_service<'a>(
             key.hash(&mut hasher);
             MemberId::from_raw_id(hasher.finish() as u32 % 5)
         }))
-        .demux_bincode(shard_servers);
+        .demux(shard_servers, TCP.fail_stop().bincode());
 
     let (sharded_increment_ack, sharded_get_response) = super::keyed_counter::keyed_counter_service(
         sharded_increment_requests,
         sharded_get_requests,
     );
 
-    let increment_ack = sharded_increment_ack.send_bincode(leader).drop_key_prefix();
+    let increment_ack = sharded_increment_ack
+        .send(leader, TCP.fail_stop().bincode())
+        .drop_key_prefix();
 
-    let get_response = sharded_get_response.send_bincode(leader).drop_key_prefix();
+    let get_response = sharded_get_response
+        .send(leader, TCP.fail_stop().bincode())
+        .drop_key_prefix();
 
     (increment_ack, get_response)
 }
@@ -53,7 +57,7 @@ mod tests {
 
     #[test]
     fn test_counter_read_after_write() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process();
         let shards = flow.cluster();
 
@@ -72,13 +76,13 @@ mod tests {
         flow.sim()
             .with_cluster_size(&shards, 5)
             .exhaustive(async || {
-                inc_in_port.send((1, "abc".to_string()));
+                inc_in_port.send((1, "abc".to_owned()));
                 inc_out_port
-                    .assert_yields_unordered([(1, "abc".to_string())])
+                    .assert_yields_unordered([(1, "abc".to_owned())])
                     .await;
-                get_in_port.send((1, "abc".to_string()));
+                get_in_port.send((1, "abc".to_owned()));
                 get_out_port
-                    .assert_yields_only_unordered([(1, ("abc".to_string(), 1))])
+                    .assert_yields_only_unordered([(1, ("abc".to_owned(), 1))])
                     .await;
             });
     }

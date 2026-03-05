@@ -85,19 +85,16 @@ pub fn http_counter_server<'a, P>(
         .values()
         .map(q!(|key| (key, ())))
         .into_keyed()
-        .fold_commutative(q!(|| 0i32), q!(|acc, _| *acc += 1));
+        .value_counts();
 
     let lookup_result = sliced! {
         let batch_get_requests = use(get_stream, nondet!(/** batch get requests */));
         let cur_counters = use::atomic(counters, nondet!(/** intentional non-determinism for get timing */));
 
-        batch_get_requests.get_from(
-            cur_counters
-        )
-        .into_keyed_stream()
+        batch_get_requests.lookup_keyed_singleton(cur_counters).into_keyed_stream()
     };
-    let get_responses = lookup_result.clone().map(q!(|(key, maybe_count)| {
-        if let Some(count) = maybe_count {
+    let get_responses =
+        lookup_result.map(q!(|(key, maybe_count)| if let Some(count) = maybe_count {
             format!(
                 "HTTP/1.1 200 OK\r\n\
                     Content-Type: application/json\r\n\
@@ -120,8 +117,7 @@ pub fn http_counter_server<'a, P>(
                 format!("{{\"key\": {}, \"count\": 0}}", key).len(),
                 key
             )
-        }
-    }));
+        }));
 
     // Handle increment responses (just acknowledge)
     let increment_responses = increment_stream

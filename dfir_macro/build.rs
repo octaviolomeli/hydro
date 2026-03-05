@@ -66,6 +66,10 @@ fn update_book() -> Result<()> {
                     .map(|category| (category, op.name))
             })
             .into_group_map();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "nondeterministic iteration order, sorted after"
+        )]
         let categories = category_operators
             .keys()
             .copied()
@@ -116,7 +120,7 @@ fn update_book() -> Result<()> {
                     s
                 })
                 .strip_suffix(", ")
-                .unwrap_or(""),
+                .unwrap_or_default(),
             if op.soft_range_out.contains(&0) {
                 ""
             } else if op.soft_range_out.contains(&1) {
@@ -154,7 +158,7 @@ fn update_book() -> Result<()> {
                     .unwrap_or("&lt;EMPTY&gt;")
             )),
             Some(PortListSpec::Variadic) => {
-                Some("> Input port names: Variadic, as specified in arguments.".to_string())
+                Some("> Input port names: Variadic, as specified in arguments.".to_owned())
             }
         };
         let mut output_str_maybe = None;
@@ -172,7 +176,7 @@ fn update_book() -> Result<()> {
                         .unwrap_or("&lt;EMPTY&gt;")
                 ),
                 PortListSpec::Variadic => {
-                    "> Output port names: Variadic, as specified in arguments.".to_string()
+                    "> Output port names: Variadic, as specified in arguments.".to_owned()
                 }
             })
         }

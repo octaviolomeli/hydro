@@ -9,11 +9,11 @@ members = [
     "dfir_rs",
     "example_test",
     "hydro_deploy/core",
-    "hydro_deploy/hydro_deploy_examples",
     "hydro_deploy/hydro_deploy_integration",
     "hydro_lang",
     "hydro_std",
     "hydro_test",
+    "hydro_test_embedded",
     "hydro_test_template",
     "include_mdtests",
     "lattices_macro",
@@ -48,6 +48,12 @@ debug = 2
 lto = "off"
 strip = "none"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.dev.package.website_playground]
 debug-assertions = false
 
@@ -61,13 +67,18 @@ unsafe_attr_outside_unsafe = "deny"
 unused_qualifications = "warn"
 
 [workspace.lints.clippy]
+alloc_instead_of_core = "warn"
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 explicit_into_iter_loop = "warn"
 let_and_return = "allow"
+redundant_clone = "warn"
+self_named_module_files = "warn"
+str_to_string = "warn"
+try_err = "warn"
 uninlined_format_args = "allow"
-upper_case_acronyms = "warn"
+unused_async = "warn"
 
 [workspace.dependencies]
-stageleft = "0.10.3"
-stageleft_tool = "0.10.3"
+stageleft = "0.13.1"
+stageleft_tool = "0.13.1"

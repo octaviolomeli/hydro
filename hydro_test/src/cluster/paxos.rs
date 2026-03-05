@@ -271,10 +271,14 @@ pub fn leader_election<'a, L: Clone + Debug + Serialize + DeserializeOwned>(
         .interleave(p_received_p2b_ballots)
         .interleave(p_to_proposers_i_am_leader_forward_ref)
         .max()
-        .unwrap_or(proposers.singleton(q!(Ballot {
-            num: 0,
-            proposer_id: MemberId::from_raw_id(0)
-        })));
+        .unwrap_or(
+            proposers
+                .singleton(q!(Ballot {
+                    num: 0,
+                    proposer_id: MemberId::from_raw_id(0)
+                }))
+                .into(),
+        );
 
     let (p_ballot, p_has_largest_ballot) = p_ballot_calc(p_received_max_ballot.snapshot(
         proposer_tick,
@@ -304,7 +308,7 @@ pub fn leader_election<'a, L: Clone + Debug + Serialize + DeserializeOwned>(
         .if_some_then(p_ballot.clone())
         .all_ticks()
         .inspect(q!(|_| println!("Proposer leader expired, sending P1a")))
-        .broadcast_bincode(acceptors, nondet!(/** TODO */))
+        .broadcast(acceptors, TCP.fail_stop().bincode(), nondet!(/** TODO */))
         .values();
 
     let (a_max_ballot, a_to_proposers_p1b) = acceptor_p1(
@@ -416,7 +420,7 @@ fn p_leader_heartbeat<'a>(
                 nondet_reelection
             ),
         )
-        .broadcast_bincode(proposers, nondet!(/** TODO */))
+        .broadcast(proposers, TCP.fail_stop().bincode(), nondet!(/** TODO */))
         .values();
 
     let p_leader_expired = p_to_proposers_i_am_leader
@@ -444,7 +448,7 @@ fn p_leader_heartbeat<'a>(
                 )),
                 q!(Duration::from_secs(i_am_leader_check_timeout)),
                 nondet!(
-                    /// If the leader 'un-expires' due to non-determinstic delay, we return
+                    /// If the leader 'un-expires' due to non-deterministic delay, we return
                     /// to a stable leader state. If the leader remains expired, non-deterministic
                     /// delay is propagated to the non-determinism of which leader is elected.
                     nondet_reelection
@@ -492,7 +496,7 @@ fn acceptor_p1<'a, L: Serialize + DeserializeOwned + Clone>(
                 )
             )))
             .all_ticks()
-            .demux_bincode(proposers)
+            .demux(proposers, TCP.fail_stop().bincode())
             .values(),
     )
 }
@@ -589,7 +593,7 @@ pub fn recommit_after_leader_election<'a, P: PaxosPayload>(
         .map(q!(|(_checkpoint, log)| log))
         .flatten_unordered() // Convert HashMap log back to stream
         .into_keyed()
-        .fold_commutative::<(usize, Option<LogValue<P>>), _, _>(q!(|| (0, None)), q!(|curr_entry, new_entry| {
+        .fold::<(usize, Option<LogValue<P>>), _, _, _, _>(q!(|| (0, None)), q!(|curr_entry, new_entry| {
             if let Some(curr_entry_payload) = &mut curr_entry.1 {
                 let same_values = new_entry.value == curr_entry_payload.value;
                 let higher_ballot = new_entry.ballot > curr_entry_payload.ballot;
@@ -609,7 +613,7 @@ pub fn recommit_after_leader_election<'a, P: PaxosPayload>(
             } else {
                 *curr_entry = (1, Some(new_entry));
             }
-        }))
+        }, commutative = manual_proof!(/** TODO */)))
         .map(q!(|(count, entry)| (count, entry.unwrap())));
     let p_log_to_try_commit = p_p1b_highest_entries_and_count
         .clone()
@@ -723,7 +727,7 @@ fn sequence_payload<'a, P: PaxosPayload>(
                 slot,
                 value
             }))
-            .broadcast_bincode(acceptors, nondet!(/** TODO */))
+            .broadcast(acceptors, TCP.fail_stop().bincode(), nondet!(/** TODO */))
             .values(),
         a_checkpoint,
         proposers,
@@ -771,7 +775,6 @@ pub fn index_payloads<'a, L: Location<'a> + NoTick, P: PaxosPayload>(
 
         let num_payloads = indexed_payloads.clone().count();
         next_slot = num_payloads
-            .clone()
             .zip(base_slot)
             .map(q!(|(num_payloads, base_slot)| base_slot + num_payloads));
 
@@ -827,7 +830,7 @@ pub fn acceptor_p2<'a, P: PaxosPayload, S: Clone>(
             }
         ));
     let a_log = a_p2as_to_place_in_log.across_ticks(|s| {
-        s.into_keyed().reduce_watermark_commutative(
+        s.into_keyed().reduce_watermark(
             a_checkpoint.clone(),
             q!(|prev_entry, entry| {
                 // Insert p2a into the log if it has a higher ballot than what was there before
@@ -837,14 +840,17 @@ pub fn acceptor_p2<'a, P: PaxosPayload, S: Clone>(
                         value: entry.value,
                     };
                 }
-            }),
+            }, commutative = manual_proof!(/** max by ballot (TODO: not if two entries with same ballot, need assume) */)),
         )
     });
-    let a_log_snapshot = a_log.entries().fold_commutative(
+    let a_log_snapshot = a_log.entries().fold(
         q!(|| HashMap::new()),
-        q!(|map, (slot, entry)| {
-            map.insert(slot, entry);
-        }),
+        q!(
+            |map, (slot, entry)| {
+                map.insert(slot, entry);
+            },
+            commutative = manual_proof!(/** inserting elements into map is commutative because no keys will overlap */)
+        ),
     );
 
     let a_to_proposers_p2b = p_to_acceptors_p2a_batch
@@ -861,7 +867,7 @@ pub fn acceptor_p2<'a, P: PaxosPayload, S: Clone>(
             )
         )))
         .all_ticks()
-        .demux_bincode(proposers)
+        .demux(proposers, TCP.fail_stop().bincode())
         .values();
 
     (
@@ -881,7 +887,7 @@ mod tests {
 
     #[test]
     fn proposer_indexes_payloads() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
         let tick = node.tick();
 
@@ -907,7 +913,7 @@ mod tests {
 
     #[test]
     fn proposer_indexes_payloads_jumps_on_new_max() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let node = flow.process::<()>();
         let tick = node.tick();
 

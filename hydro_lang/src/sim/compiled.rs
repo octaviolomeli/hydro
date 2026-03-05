@@ -2,7 +2,7 @@
 
 use core::{fmt, panic};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::panic::RefUnwindSafe;
 use std::path::Path;
@@ -24,13 +24,16 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::runtime::{Hooks, InlineHooks};
 use super::{SimReceiver, SimSender};
+use crate::compile::builder::ExternalPortId;
 use crate::live_collections::stream::{ExactlyOnce, NoOrder, Ordering, Retries, TotalOrder};
 use crate::location::dynamic::LocationId;
+use crate::sim::graph::{SimExternalPort, SimExternalPortRegistry};
+use crate::sim::runtime::SimHook;
 
 struct SimConnections {
-    input_senders: HashMap<usize, Rc<UnboundedSender<Bytes>>>,
-    output_receivers: HashMap<usize, Rc<Mutex<UnboundedReceiverStream<Bytes>>>>,
-    external_registered: HashMap<usize, usize>,
+    input_senders: HashMap<SimExternalPort, Rc<UnboundedSender<Bytes>>>,
+    output_receivers: HashMap<SimExternalPort, Rc<Mutex<UnboundedReceiverStream<Bytes>>>>,
+    external_registered: HashMap<ExternalPortId, SimExternalPort>,
 }
 
 tokio::task_local! {
@@ -41,8 +44,7 @@ tokio::task_local! {
 pub struct CompiledSim {
     pub(super) _path: TempPath,
     pub(super) lib: Library,
-    pub(super) external_ports: Vec<usize>,
-    pub(super) external_registered: HashMap<usize, usize>,
+    pub(super) externals_port_registry: SimExternalPortRegistry,
 }
 
 #[sealed::sealed]
@@ -71,11 +73,13 @@ fn eprintln_handler(args: fmt::Arguments) {
 type SimLoaded<'a> = libloading::Symbol<
     'a,
     unsafe extern "Rust" fn(
-        bool,
-        HashMap<usize, UnboundedSender<Bytes>>,
-        HashMap<usize, UnboundedReceiverStream<Bytes>>,
-        fn(fmt::Arguments<'_>),
-        fn(fmt::Arguments<'_>),
+        should_color: bool,
+        // usize: SimExternalPort
+        external_out: HashMap<usize, UnboundedSender<Bytes>>,
+        // usize: SimExternalPort
+        external_in: HashMap<usize, UnboundedReceiverStream<Bytes>>,
+        println_handler: fn(fmt::Arguments<'_>),
+        eprintln_handler: fn(fmt::Arguments<'_>),
     ) -> (
         Vec<(&'static str, Option<u32>, Dfir<'static>)>,
         Vec<(&'static str, Option<u32>, Dfir<'static>)>,
@@ -107,8 +111,7 @@ impl CompiledSim {
         thunk(
             &(|| CompiledSimInstance {
                 func: func.clone(),
-                remaining_ports: self.external_ports.iter().cloned().collect(),
-                external_registered: self.external_registered.clone(),
+                externals_port_registry: self.externals_port_registry.clone(),
                 input_ports: HashMap::new(),
                 output_ports: HashMap::new(),
                 log,
@@ -134,6 +137,7 @@ impl CompiledSim {
                 !e.fn_name.starts_with("hydro_lang::sim::compiled")
                     && !e.fn_name.starts_with("hydro_lang::sim::flow")
                     && !e.fn_name.starts_with("fuzz<")
+                    && !e.fn_name.starts_with("<hydro_lang::sim")
             })
             .unwrap();
 
@@ -329,10 +333,9 @@ impl CompiledSim {
 /// execute the simulation, feed inputs, and receive outputs.
 pub struct CompiledSimInstance<'a> {
     func: SimLoaded<'a>,
-    remaining_ports: HashSet<usize>,
-    external_registered: HashMap<usize, usize>,
-    output_ports: HashMap<usize, UnboundedSender<Bytes>>,
-    input_ports: HashMap<usize, UnboundedReceiverStream<Bytes>>,
+    externals_port_registry: SimExternalPortRegistry,
+    output_ports: HashMap<SimExternalPort, UnboundedSender<Bytes>>,
+    input_ports: HashMap<SimExternalPort, UnboundedReceiverStream<Bytes>>,
     log: bool,
 }
 
@@ -351,12 +354,12 @@ impl<'a> CompiledSimInstance<'a> {
     ) {
         let mut input_senders = HashMap::new();
         let mut output_receivers = HashMap::new();
-        for remaining in &self.remaining_ports {
+        for registered_port in self.externals_port_registry.port_counter.range_up_to() {
             {
                 let (sender, receiver) = dfir_rs::util::unbounded_channel::<Bytes>();
-                self.output_ports.insert(*remaining, sender);
+                self.output_ports.insert(registered_port, sender);
                 output_receivers.insert(
-                    *remaining,
+                    registered_port,
                     Rc::new(Mutex::new(UnboundedReceiverStream::new(
                         receiver.into_inner(),
                     ))),
@@ -365,8 +368,8 @@ impl<'a> CompiledSimInstance<'a> {
 
             {
                 let (sender, receiver) = dfir_rs::util::unbounded_channel::<Bytes>();
-                self.input_ports.insert(*remaining, receiver);
-                input_senders.insert(*remaining, Rc::new(sender));
+                self.input_ports.insert(registered_port, receiver);
+                input_senders.insert(registered_port, Rc::new(sender));
             }
         }
 
@@ -376,7 +379,7 @@ impl<'a> CompiledSimInstance<'a> {
                 RefCell::new(SimConnections {
                     input_senders,
                     output_receivers,
-                    external_registered: self.external_registered.clone(),
+                    external_registered: self.externals_port_registry.registered.clone(),
                 }),
                 async move {
                     thunk(self).await;
@@ -407,8 +410,14 @@ impl<'a> CompiledSimInstance<'a> {
         let (async_dfirs, tick_dfirs, hooks, inline_hooks) = unsafe {
             (self.func)(
                 colored::control::SHOULD_COLORIZE.should_colorize(),
-                self.output_ports,
-                self.input_ports,
+                self.output_ports
+                    .into_iter()
+                    .map(|(k, v)| (k.into_inner(), v))
+                    .collect(),
+                self.input_ports
+                    .into_iter()
+                    .map(|(k, v)| (k.into_inner(), v))
+                    .collect(),
                 if self.log {
                     println_handler
                 } else {
@@ -421,6 +430,12 @@ impl<'a> CompiledSimInstance<'a> {
                 },
             )
         };
+
+        let not_ready_observation = async_dfirs
+            .iter()
+            .map(|(lid, c_id, _)| (serde_json::from_str(lid).unwrap(), *c_id))
+            .collect();
+
         let mut launched = LaunchedSim {
             async_dfirs: async_dfirs
                 .into_iter()
@@ -431,6 +446,8 @@ impl<'a> CompiledSimInstance<'a> {
                 .into_iter()
                 .map(|(lid, c_id, dfir)| (serde_json::from_str(lid).unwrap(), c_id, dfir))
                 .collect(),
+            possibly_ready_observation: vec![],
+            not_ready_observation,
             hooks: hooks
                 .into_iter()
                 .map(|((lid, cid), hs)| ((serde_json::from_str(lid).unwrap(), cid), hs))
@@ -494,10 +511,10 @@ impl<T: Serialize + DeserializeOwned, O: Ordering, R: Retries> SimReceiver<T, O,
             future: async move {
                 self.with_stream(async |stream| {
                     if let Some(next) = stream.next().await {
-                        Err(format!(
+                        return Err(format!(
                             "Stream yielded unexpected message: {:?}, expected termination",
                             next
-                        ))?;
+                        ));
                     }
                     Ok(())
                 })
@@ -538,16 +555,16 @@ impl<T: Serialize + DeserializeOwned> SimReceiver<T, TotalOrder, ExactlyOnce> {
                     if let Some(next) = self.next().await {
                         let next_expected = expected.pop_front().unwrap();
                         if next != next_expected {
-                            Err(format!(
+                            return Err(format!(
                                 "Stream yielded unexpected message: {:?}, expected: {:?}",
                                 next, next_expected
-                            ))?
+                            ));
                         }
                     } else {
-                        Err(format!(
+                        return Err(format!(
                             "Stream ended early, still expected: {:?}",
                             expected
-                        ))?;
+                        ));
                     }
                 }
 
@@ -669,13 +686,16 @@ impl<T: Serialize + DeserializeOwned> SimReceiver<T, NoOrder, ExactlyOnce> {
                             if let Some((i, _)) = idx {
                                 expected.swap_remove(i);
                             } else {
-                                Err(format!("Stream yielded unexpected message: {:?}", next))?
+                                return Err(format!(
+                                    "Stream yielded unexpected message: {:?}",
+                                    next
+                                ));
                             }
                         } else {
-                            Err(format!(
+                            return Err(format!(
                                 "Stream ended early, still expected: {:?}",
                                 expected
-                            ))?
+                            ));
                         }
                     }
 
@@ -723,7 +743,7 @@ impl<T: Serialize + DeserializeOwned, O: Ordering, R: Retries> SimSender<T, O, R
 
 impl<T: Serialize + DeserializeOwned, O: Ordering> SimSender<T, O, ExactlyOnce> {
     /// Sends several messages to the external bincode sink. The messages will be asynchronously
-    /// processed as part of the simulation, in non-determinstic order.
+    /// processed as part of the simulation, in non-deterministic order.
     pub fn send_many_unordered<I: IntoIterator<Item = T>>(&self, iter: I) {
         self.with_sink(|send| {
             for t in iter {
@@ -777,6 +797,8 @@ struct LaunchedSim<W: std::io::Write> {
     async_dfirs: Vec<(LocationId, Option<u32>, Dfir<'static>)>,
     possibly_ready_ticks: Vec<(LocationId, Option<u32>, Dfir<'static>)>,
     not_ready_ticks: Vec<(LocationId, Option<u32>, Dfir<'static>)>,
+    possibly_ready_observation: Vec<(LocationId, Option<u32>)>,
+    not_ready_observation: Vec<(LocationId, Option<u32>)>,
     hooks: Hooks<LocationId>,
     inline_hooks: InlineHooks<LocationId>,
     log: LogKind<W>,
@@ -802,6 +824,14 @@ impl<W: std::io::Write> LaunchedSim<W> {
 
                     self.possibly_ready_ticks.extend(now_ready);
                     self.not_ready_ticks.extend(still_not_ready);
+
+                    let (now_ready_obs, still_not_ready_obs): (Vec<_>, Vec<_>) = self
+                        .not_ready_observation
+                        .drain(..)
+                        .partition(|(obs_loc, obs_c_id)| obs_loc == loc && obs_c_id == c_id);
+
+                    self.possibly_ready_observation.extend(now_ready_obs);
+                    self.not_ready_observation.extend(still_not_ready_obs);
                 }
             }
 
@@ -810,7 +840,7 @@ impl<W: std::io::Write> LaunchedSim<W> {
             } else {
                 use bolero::generator::*;
 
-                let (ready, mut not_ready): (Vec<_>, Vec<_>) = self
+                let (ready_tick, mut not_ready_tick): (Vec<_>, Vec<_>) = self
                     .possibly_ready_ticks
                     .drain(..)
                     .partition(|(name, cid, _)| {
@@ -824,119 +854,157 @@ impl<W: std::io::Write> LaunchedSim<W> {
                             })
                     });
 
-                self.possibly_ready_ticks = ready;
-                self.not_ready_ticks.append(&mut not_ready);
+                self.possibly_ready_ticks = ready_tick;
+                self.not_ready_ticks.append(&mut not_ready_tick);
 
-                if self.possibly_ready_ticks.is_empty() {
+                let (ready_obs, mut not_ready_obs): (Vec<_>, Vec<_>) = self
+                    .possibly_ready_observation
+                    .drain(..)
+                    .partition(|(name, cid)| {
+                        self.hooks
+                            .get(&(name.clone(), *cid))
+                            .into_iter()
+                            .flatten()
+                            .any(|hook| {
+                                hook.current_decision().unwrap_or(false)
+                                    || hook.can_make_nontrivial_decision()
+                            })
+                    });
+
+                self.possibly_ready_observation = ready_obs;
+                self.not_ready_observation.append(&mut not_ready_obs);
+
+                if self.possibly_ready_ticks.is_empty()
+                    && self.possibly_ready_observation.is_empty()
+                {
                     break;
                 } else {
-                    let next_tick = (0..self.possibly_ready_ticks.len()).any();
-                    let mut removed = self.possibly_ready_ticks.remove(next_tick);
+                    let next_tick_or_obs = (0..(self.possibly_ready_ticks.len()
+                        + self.possibly_ready_observation.len()))
+                        .any();
 
-                    match &mut self.log {
-                        LogKind::Null => {}
-                        LogKind::Stderr => {
-                            if let Some(cid) = &removed.1 {
-                                eprintln!(
-                                    "\n{}",
-                                    format!("Running Tick (Cluster Member {})", cid)
-                                        .color(colored::Color::Magenta)
-                                        .bold()
-                                )
-                            } else {
-                                eprintln!(
+                    if next_tick_or_obs < self.possibly_ready_ticks.len() {
+                        let next_tick = next_tick_or_obs;
+                        let mut removed = self.possibly_ready_ticks.remove(next_tick);
+
+                        match &mut self.log {
+                            LogKind::Null => {}
+                            LogKind::Stderr => {
+                                if let Some(cid) = &removed.1 {
+                                    eprintln!(
+                                        "\n{}",
+                                        format!("Running Tick (Cluster Member {})", cid)
+                                            .color(colored::Color::Magenta)
+                                            .bold()
+                                    )
+                                } else {
+                                    eprintln!(
+                                        "\n{}",
+                                        "Running Tick".color(colored::Color::Magenta).bold()
+                                    )
+                                }
+                            }
+                            LogKind::Custom(writer) => {
+                                writeln!(
+                                    writer,
                                     "\n{}",
                                     "Running Tick".color(colored::Color::Magenta).bold()
                                 )
+                                .unwrap();
                             }
                         }
-                        LogKind::Custom(writer) => {
-                            writeln!(
-                                writer,
-                                "\n{}",
-                                "Running Tick".color(colored::Color::Magenta).bold()
-                            )
-                            .unwrap();
-                        }
-                    }
 
-                    let mut asterisk_indenter = |_line_no, write: &mut dyn std::fmt::Write| {
-                        write.write_str(&"*".color(colored::Color::Magenta).bold())?;
-                        write.write_str(" ")
-                    };
+                        let mut asterisk_indenter = |_line_no, write: &mut dyn std::fmt::Write| {
+                            write.write_str(&"*".color(colored::Color::Magenta).bold())?;
+                            write.write_str(" ")
+                        };
 
-                    let mut tick_decision_writer =
-                        indenter::indented(&mut self.log).with_format(indenter::Format::Custom {
-                            inserter: &mut asterisk_indenter,
-                        });
+                        let mut tick_decision_writer = indenter::indented(&mut self.log)
+                            .with_format(indenter::Format::Custom {
+                                inserter: &mut asterisk_indenter,
+                            });
 
-                    let hooks = self.hooks.get_mut(&(removed.0.clone(), removed.1)).unwrap();
-                    let mut remaining_decision_count = hooks.len();
-                    let mut made_nontrivial_decision = false;
+                        let hooks = self.hooks.get_mut(&(removed.0.clone(), removed.1)).unwrap();
+                        run_hooks(&mut tick_decision_writer, hooks);
 
-                    bolero_generator::any::scope::borrow_with(|driver| {
-                        // first, scan manual decisions
-                        hooks.iter_mut().for_each(|hook| {
-                            if let Some(is_nontrivial) = hook.current_decision() {
-                                made_nontrivial_decision |= is_nontrivial;
-                                remaining_decision_count -= 1;
-                            } else if !hook.can_make_nontrivial_decision() {
-                                // if no nontrivial decision is possible, make a trivial one
-                                // (we need to do this in the first pass to force nontrivial decisions
-                                // on the remaining hooks)
-                                hook.autonomous_decision(driver, false);
-                                remaining_decision_count -= 1;
-                            }
-                        });
+                        let run_tick_future = removed.2.run_tick();
+                        if let Some(inline_hooks) =
+                            self.inline_hooks.get_mut(&(removed.0.clone(), removed.1))
+                        {
+                            let mut run_tick_future_pinned = pin!(run_tick_future);
 
-                        hooks.iter_mut().for_each(|hook| {
-                            if hook.current_decision().is_none() {
-                                made_nontrivial_decision |= hook.autonomous_decision(
-                                    driver,
-                                    !made_nontrivial_decision && remaining_decision_count == 1,
-                                );
-                                remaining_decision_count -= 1;
-                            }
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    r = &mut run_tick_future_pinned => {
+                                        assert!(r);
+                                        break;
+                                    }
+                                    _ = async {} => {
+                                        bolero_generator::any::scope::borrow_with(|driver| {
+                                            for hook in inline_hooks.iter_mut() {
+                                                if hook.pending_decision() {
+                                                    if !hook.has_decision() {
+                                                        hook.autonomous_decision(driver);
+                                                    }
 
-                            hook.release_decision(&mut tick_decision_writer);
-                        });
-                    });
-
-                    let run_tick_future = removed.2.run_tick();
-                    if let Some(inline_hooks) =
-                        self.inline_hooks.get_mut(&(removed.0.clone(), removed.1))
-                    {
-                        let mut run_tick_future_pinned = pin!(run_tick_future);
-
-                        loop {
-                            tokio::select! {
-                                biased;
-                                r = &mut run_tick_future_pinned => {
-                                    assert!(r);
-                                    break;
-                                }
-                                _ = async {} => {
-                                    bolero_generator::any::scope::borrow_with(|driver| {
-                                        for hook in inline_hooks.iter_mut() {
-                                            if hook.pending_decision() {
-                                                if !hook.has_decision() {
-                                                    hook.autonomous_decision(driver);
+                                                    hook.release_decision(&mut tick_decision_writer);
                                                 }
-
-                                                hook.release_decision(&mut tick_decision_writer);
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                             }
+                        } else {
+                            assert!(run_tick_future.await);
                         }
-                    } else {
-                        assert!(run_tick_future.await);
-                    }
 
-                    self.possibly_ready_ticks.push(removed);
+                        self.possibly_ready_ticks.push(removed);
+                    } else {
+                        let next_obs = next_tick_or_obs - self.possibly_ready_ticks.len();
+                        let mut default_hooks = vec![];
+                        let hooks = self
+                            .hooks
+                            .get_mut(&self.possibly_ready_observation[next_obs])
+                            .unwrap_or(&mut default_hooks);
+
+                        run_hooks(&mut self.log, hooks);
+                    }
                 }
             }
         }
     }
+}
+
+fn run_hooks(tick_decision_writer: &mut impl std::fmt::Write, hooks: &mut Vec<Box<dyn SimHook>>) {
+    let mut remaining_decision_count = hooks.len();
+    let mut made_nontrivial_decision = false;
+
+    bolero::generator::bolero_generator::any::scope::borrow_with(|driver| {
+        // first, scan manual decisions
+        hooks.iter_mut().for_each(|hook| {
+            if let Some(is_nontrivial) = hook.current_decision() {
+                made_nontrivial_decision |= is_nontrivial;
+                remaining_decision_count -= 1;
+            } else if !hook.can_make_nontrivial_decision() {
+                // if no nontrivial decision is possible, make a trivial one
+                // (we need to do this in the first pass to force nontrivial decisions
+                // on the remaining hooks)
+                hook.autonomous_decision(driver, false);
+                remaining_decision_count -= 1;
+            }
+        });
+
+        hooks.iter_mut().for_each(|hook| {
+            if hook.current_decision().is_none() {
+                made_nontrivial_decision |= hook.autonomous_decision(
+                    driver,
+                    !made_nontrivial_decision && remaining_decision_count == 1,
+                );
+                remaining_decision_count -= 1;
+            }
+
+            hook.release_decision(tick_decision_writer);
+        });
+    });
 }

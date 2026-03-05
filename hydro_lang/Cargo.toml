@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 default = []
+stageleft_macro_entrypoint = []
 viz = [
     "build",
     "dep:auto_impl",
@@ -27,9 +28,11 @@ viz = [
 deploy = [
     "trybuild",
     "deploy_integration",
+
     "dep:hydro_deploy",
     "dep:nameof",
 ]
+
 sim = [
     "trybuild",
     "deploy_integration",
@@ -41,30 +44,63 @@ sim = [
     "dep:pin-project-lite",
     "dep:tempfile",
     "dep:serde_json",
-    "dfir_rs/meta", # affects layout of DFIR, thus the ABI
+    "dfir_rs/meta",         # affects layout of DFIR, thus the ABI
 ]
 
-# Dependencies needed to build the code that can deploy a hydro program with docker
 docker_deploy = [
-    "trybuild",
+    "deploy",
     "docker_runtime",
-    "dep:bollard",
+
     "dep:anyhow",
-    "dep:tar",
-    "dep:nanoid",
+    "dep:base64",
+    "dep:bollard",
     "dep:http-body-util",
+    "dep:nanoid",
+    "dep:serde_json",
+    "dep:tar",
+]
+ecs_deploy = [
+    "deploy",
+    "ecs_runtime",
+
+    "dep:anyhow",
 ]
 
-# Dependencies needed to compile docker-deployed binaries with trybuild
+maelstrom = [
+    "trybuild",
+    "maelstrom_runtime",
+]
+
+# Dependencies needed to compile docker-targeted binaries with trybuild
 docker_runtime = [
+    "deploy_integration",
+
     "dep:bollard",
 ]
+
+# Dependencies needed to compile ecs-targeted binaries with trybuild
+ecs_runtime = [
+    "deploy_integration",
+
+    "dep:aws-config",
+    "dep:aws-sdk-ecs",
+    "dep:regex",
+]
+
+# Dependencies needed to compile maelstrom-targeted binaries with trybuild
+maelstrom_runtime = [
+    "deploy_integration",
+    "tokio-stream/sync",
+    "dep:serde_json",
+]
+
+embedded_runtime = ["deploy_integration", "runtime_support"]
 
 deploy_integration = ["dep:hydro_deploy_integration"]
 build = ["dep:dfir_lang", "dep:backtrace", "dep:ctor"]
 trybuild = ["build", "dep:toml", "dep:prettyplease", "dep:stageleft_tool", "dep:trybuild-internals-api", "dep:sha2"]
-runtime_measure = ["dep:chrono", "dep:procfs"]
-runtime_support = ["dep:dfir_rs", "dfir_rs/deploy_integration"]
+runtime_measure = ["dep:procfs"]
+runtime_support = ["dep:dfir_rs", "dep:serde_json"]
 dfir_context = ["dep:dfir_rs"]
 
 [package.metadata.docs.rs]
@@ -72,18 +108,19 @@ all-features = true
 
 [dependencies]
 backtrace = { version = "0.3", optional = true }
-bytes = { version = "1.1.0", features = ["serde"] }
 bincode = "1.3.1"
+buildstructor = "0.6.0"
+bytes = { version = "1.1.0", features = ["serde"] }
+chrono = "0.4.42"
 clap = { version = "4.0", features = ["derive"], optional = true }
 colored = { version = "3" }
+copy_span = { path = "../copy_span", version = "^0.1.0" }
+ctor = { version = "0.2", optional = true }
+dfir_lang = { path = "../dfir_lang", version = "^0.15.0", optional = true }
+dfir_rs = { path = "../dfir_rs", version = "^0.15.0", default-features = false, optional = true }
+futures = "0.3.0"
 hydro_deploy = { path = "../hydro_deploy/core", version = "^0.15.0", optional = true }
 hydro_deploy_integration = { path = "../hydro_deploy/hydro_deploy_integration", version = "^0.15.0", optional = true }
-chrono = "0.4.42"
-copy_span = { path = "../copy_span", version = "^0.1.0" }
-dfir_rs = { path = "../dfir_rs", version = "^0.15.0", default-features = false, optional = true }
-dfir_lang = { path = "../dfir_lang", version = "^0.15.0", optional = true }
-futures = "0.3.0"
-match_box = "0.0.2"
 nameof = { version = "1.0.0", optional = true }
 prettyplease = { version = "0.2.0", features = ["verbatim"], optional = true }
 proc-macro-crate = "3.3"
@@ -91,10 +128,11 @@ proc-macro2 = "1.0.95"
 quote = "1.0.35"
 sealed = "0.6.0"
 serde = { version = "1.0.197", features = ["derive"] }
-sinktools = { path = "../sinktools", version = "^0.0.1" }
 sha2 = { version = "0.10.0", optional = true }
-stageleft.workspace = true
+sinktools = { path = "../sinktools", version = "^0.0.1" }
+slotmap = { version = "1.0.0", features = ["serde"] }
 stageleft_tool = { workspace = true, optional = true }
+stageleft.workspace = true
 syn = { version = "2.0.46", features = [
     "parsing",
     "extra-traits",
@@ -102,15 +140,15 @@ syn = { version = "2.0.46", features = [
     "visit",
 ] }
 tokio = "1.29.0"
-tokio-util = { version = "0.7.5", features = [ "codec" ] }
+tokio-metrics = "0.4.6"
 tokio-stream = { version = "0.1.3", default-features = false, features = [
     "time",
 ] }
-toml = { version = "0.8.0", optional = true }
+tokio-util = { version = "0.7.5", features = ["codec"] }
+toml = { version = "0.9", optional = true }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-trybuild-internals-api = { version = "1.0.99", optional = true }
-ctor = { version = "0.2", optional = true }
+trybuild-internals-api = { version = "=1.0.114", optional = true }
 
 # Optional dependencies for graph rendering (now behind viz feature)
 auto_impl = { version = "1.2.0", optional = true }
@@ -123,10 +161,18 @@ urlencoding = { version = "2.1", optional = true }
 
 # For docker deployments
 anyhow = { version = "1.0.100", optional = true }
-bollard = { version = "0.19.4", default-features = false, features = ["pipe"], optional = true }
+bollard = { version = "0.19.4", default-features = false, features = [
+    "pipe",
+], optional = true }
 http-body-util = { version = "0.1", optional = true }
 nanoid = { version = "0.4.0", optional = true }
 tar = { version = "0.4", optional = true }
+
+# optional dependencies for ECS
+aws-config = { version = "*", optional = true, default-features = false, features = [ "rt-tokio", "default-https-client" ] }
+aws-sdk-ecs = { version = "*", optional = true, default-features = false }
+base64 = { version = "*", optional = true }
+regex = { version = "1.12.2", optional = true }
 
 # For the simulator
 bolero = { package = "bolero-hydro", version = "0.13.5", optional = true }
@@ -142,7 +188,6 @@ tempfile = { version = "3", optional = true }
 hydro_build_utils = { path = "../hydro_build_utils", version = "^0.0.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-chrono = { version = "0.4.39", optional = true }
 procfs = { version = "0.17.0", optional = true }
 
 [build-dependencies]

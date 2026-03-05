@@ -36,7 +36,7 @@ mod tests {
     async fn test_reachability() {
         let mut deployment = Deployment::new();
 
-        let builder = hydro_lang::compile::builder::FlowBuilder::new();
+        let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
         let external = builder.external::<()>();
         let p1 = builder.process();
 
@@ -45,7 +45,7 @@ mod tests {
         let out = super::graph_reachability(roots, edges);
         let out_recv = out.send_bincode_external(&external);
 
-        let built = builder.with_default_optimize();
+        let mut built = builder.with_default_optimize();
 
         println!(
             "{}",

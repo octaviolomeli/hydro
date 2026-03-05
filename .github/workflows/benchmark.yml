@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.pull_request.base.sha }}-${{ github.event_name }}
@@ -56,6 +57,15 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
+      - name: Post initial comment on PR
+        if: ${{ github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const script = require('./.github/workflows/benchmark-comment.js');
+            await script.postBenchmarkComment(github, context);
+
       - name: Checkout gh-pages
         shell: bash
         run: |
@@ -77,6 +87,7 @@ jobs:
         run: |
           time cargo bench -p benches -- dfir --output-format bencher | tee output.txt
           time cargo bench -p benches -- micro/ops/ --output-format bencher | tee -a output.txt
+          time cargo bench -p hydro_test --profile=dev | tee -a output.txt # due to staging, no need to apply optimizations to the bench runner
 
       - name: Generate benchmark page
         uses: benchmark-action/github-action-benchmark@v1
@@ -98,11 +109,21 @@ jobs:
 
       - name: Upload benchmark artifact
         uses: actions/upload-artifact@v4
+        id: artifact-upload
         with:
           name: benchmark
           path: |
             ${{ env.WWW_DIR }}/bench
             ${{ env.WWW_DIR }}/criterion
+
+      - name: Comment on PR with artifact link
+        if: ${{ github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const script = require('./.github/workflows/benchmark-comment.js');
+            await script.postBenchmarkComment(github, context, '${{ steps.artifact-upload.outputs.artifact-id }}');
 
       - name: Push to gh-pages
         # Do not deploy PRs, only benchmark main branch.

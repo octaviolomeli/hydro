@@ -1,9 +1,19 @@
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
+use hydro_deploy::gcp::GcpNetwork;
+use hydro_deploy::{AwsNetwork, Deployment, Host};
+use hydro_lang::deploy::TrybuildHost;
+use hydro_lang::location::Location;
+use hydro_lang::viz::config::GraphConfig;
+use stageleft::q;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, group(
+    clap::ArgGroup::new("cloud")
+        .args(&["gcp", "aws"])
+        .multiple(false)
+))]
 struct Args {
     #[command(flatten)]
     graph: GraphConfig,
@@ -11,11 +21,11 @@ struct Args {
     /// Use GCP for deployment (provide project name)
     #[arg(long)]
     gcp: Option<String>,
+
+    /// Use AWS, make sure credentials are set up
+    #[arg(long, action = ArgAction::SetTrue)]
+    aws: bool,
 }
-use hydro_deploy::gcp::GcpNetwork;
-use hydro_deploy::{Deployment, Host};
-use hydro_lang::deploy::TrybuildHost;
-use hydro_lang::viz::config::GraphConfig;
 use hydro_test::cluster::compartmentalized_paxos::{
     CompartmentalizedPaxosConfig, CoreCompartmentalizedPaxos,
 };
@@ -42,12 +52,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .network(network.clone())
                 .add()
         })
+    } else if args.aws {
+        let region = "us-east-1";
+        let network = AwsNetwork::new(region, None);
+
+        Box::new(move |deployment| -> Arc<dyn Host> {
+            deployment
+                .AwsEc2Host()
+                .region(region)
+                .instance_type("t3.micro")
+                .ami("ami-0e95a5e2743ec9ec9") // Amazon Linux 2
+                .network(network.clone())
+                .add()
+        })
     } else {
         let localhost = deployment.Localhost();
         Box::new(move |_| -> Arc<dyn Host> { localhost.clone() })
     };
 
-    let builder = hydro_lang::compile::builder::FlowBuilder::new();
+    let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let f = 1;
     let num_clients = 1;
     let num_clients_per_node = 100; // Change based on experiment between 1, 50, 100.
@@ -55,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let i_am_leader_send_timeout = 5; // Sec
     let i_am_leader_check_timeout = 10; // Sec
     let i_am_leader_check_timeout_delay_multiplier = 15;
+    let print_result_frequency = 1000; // Millis
 
     let num_proxy_leaders = 10;
     let acceptor_grid_rows = 2;
@@ -70,7 +94,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replicas = builder.cluster();
 
     hydro_test::cluster::paxos_bench::paxos_bench(
-        num_clients_per_node,
         checkpoint_frequency,
         f,
         num_replicas,
@@ -93,11 +116,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
         &clients,
+        clients.singleton(q!(std::env::var("NUM_CLIENTS_PER_NODE")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap())),
         &client_aggregator,
         &replicas,
+        print_result_frequency / 10,
+        print_result_frequency,
+        hydro_std::bench_client::pretty_print_bench_results,
     );
 
-    let rustflags = "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off";
+    let rustflags = if args.gcp.is_some() || args.aws {
+        "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-args=--no-rosegment"
+    } else {
+        "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+    };
 
     // Build and optimize first, then extract IR with proper location assignments
     let built = builder.finalize();
@@ -130,8 +164,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_cluster(
             &clients,
-            (0..num_clients)
-                .map(|_| TrybuildHost::new(create_host(&mut deployment)).rustflags(rustflags)),
+            (0..num_clients).map(|_| {
+                TrybuildHost::new(create_host(&mut deployment))
+                    .rustflags(rustflags)
+                    .env("NUM_CLIENTS_PER_NODE", num_clients_per_node.to_string())
+            }),
         )
         .with_process(
             &client_aggregator,

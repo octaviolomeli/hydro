@@ -7,8 +7,10 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
+#[cfg(feature = "profile-folding")]
 use inferno::collapse::perf::Options as PerfOptions;
 
+#[cfg(feature = "profile-folding")]
 type FlamegraphOptions = inferno::flamegraph::Options<'static>;
 
 /// `Cow<'static, str>`.
@@ -33,10 +35,12 @@ pub struct TracingOptions {
     // pub perf_script_outfile: Option<PathBuf>,
     /// If set, what the write the folded output to.
     pub fold_outfile: Option<PathBuf>,
+    #[cfg(feature = "profile-folding")]
     pub fold_perf_options: Option<PerfOptions>,
     /// If set, what to write the output flamegraph SVG file to.
     pub flamegraph_outfile: Option<PathBuf>,
     // This type is super annoying and isn't `clone` and has a lifetime... so wrap in fn pointer for now.
+    #[cfg(feature = "profile-folding")]
     pub flamegraph_options: Option<fn() -> FlamegraphOptions>,
 
     /// Command to setup tracing before running the command, i.e. to install `perf` or set kernel flags.
@@ -51,3 +55,13 @@ pub struct TracingOptions {
 ///
 /// Uses `apt` to install `linux-perf` and `binutils`, sets kernel parameters to allow tracing, and disables `kptr_restrict`.
 pub const DEBIAN_PERF_SETUP_COMMAND: &str = "sudo sh -c 'apt update && apt install -y linux-perf binutils && echo -1 > /proc/sys/kernel/perf_event_paranoid && echo 0 > /proc/sys/kernel/kptr_restrict'";
+
+/// A command to run on Amazon Linux 2 (AL2) systems to set up `perf` for tracing.
+///
+/// Uses `yum` to install `perf`, sets kernel parameters to allow tracing, and disables `kptr_restrict`.
+pub const AL2_PERF_SETUP_COMMAND: &str = "sudo sh -c 'yum install -y perf && echo -1 > /proc/sys/kernel/perf_event_paranoid && echo 0 > /proc/sys/kernel/kptr_restrict'";
+
+/// A command to run on Amazon Linux 2023 to set up `perf` for tracing.
+///
+/// Uses `dnf` to install `perf`, sets kernel parameters to allow tracing, and disables `kptr_restrict`.
+pub const AL2023_PERF_SETUP_COMMAND: &str = "sudo sh -c 'dnf update -y && dnf install perf -y && echo -1 > /proc/sys/kernel/perf_event_paranoid && echo 0 > /proc/sys/kernel/kptr_restrict'";

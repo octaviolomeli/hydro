@@ -1,17 +1,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use hdrhistogram::Histogram;
 use hdrhistogram::serialization::{Deserializer, Serializer, V2Serializer};
-use hydro_lang::live_collections::stream::{NoOrder, TotalOrder};
+use hydro_lang::live_collections::stream::{ExactlyOnce, NoOrder, TotalOrder};
 use hydro_lang::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub mod rolling_average;
-use rolling_average::RollingAverage;
-
-use crate::membership::track_membership;
 
 pub struct SerializableHistogramWrapper {
     pub histogram: Rc<RefCell<Histogram<u64>>>,
@@ -37,280 +34,282 @@ impl<'a> Deserialize<'a> for SerializableHistogramWrapper {
         })
     }
 }
-pub struct BenchResult<'a, Client> {
-    pub latency_histogram: Singleton<Rc<RefCell<Histogram<u64>>>, Cluster<'a, Client>, Unbounded>,
-    pub throughput: Singleton<RollingAverage, Cluster<'a, Client>, Unbounded>,
+
+pub struct BenchResult<L> {
+    pub latency_histogram:
+        Stream<Rc<RefCell<Histogram<u64>>>, L, Unbounded, TotalOrder, ExactlyOnce>,
+    pub throughput: Stream<usize, L, Unbounded, TotalOrder, ExactlyOnce>,
 }
 
 /// Benchmarks transactional workloads by concurrently submitting workloads
-/// (up to `num_clients_per_node` per machine), measuring the latency
-/// of each transaction and throughput over the entire workload.
-/// * `workload_generator` - Generates a payload `P` for each virtual client
-/// * `transaction_cycle` - Processes the payloads and returns after processing
+/// (up to `num_clients_per_node` per machine)
+/// * `num_clients_per_node`: Number of virtual clients per machine
+/// * `workload_generator`: Converts previous output (or None, for new virtual clients) into the next input payload
+/// * `protocol`: The protocol to benchmark
 ///
-/// # Non-Determinism
-/// This function uses non-deterministic wall-clock windows for measuring throughput.
-pub fn bench_client<'a, Client, Payload>(
+/// ## Returns
+/// A stream of latencies per completed client request
+pub fn bench_client<'a, Client, Input, Output>(
     clients: &Cluster<'a, Client>,
+    num_clients_per_node: Singleton<usize, Cluster<'a, Client>, Bounded>,
     workload_generator: impl FnOnce(
-        &Cluster<'a, Client>,
-        Stream<(u32, Option<Payload>), Cluster<'a, Client>, Unbounded, NoOrder>,
+        KeyedStream<u32, Option<Output>, Cluster<'a, Client>, Unbounded, NoOrder>,
     )
-        -> Stream<(u32, Payload), Cluster<'a, Client>, Unbounded, NoOrder>,
-    transaction_cycle: impl FnOnce(
-        Stream<(u32, Payload), Cluster<'a, Client>, Unbounded>,
-    )
-        -> Stream<(u32, Payload), Cluster<'a, Client>, Unbounded, NoOrder>,
-    num_clients_per_node: usize,
-    nondet_throughput_window: NonDet,
-) -> BenchResult<'a, Client>
+        -> KeyedStream<u32, Input, Cluster<'a, Client>, Unbounded, NoOrder>,
+    protocol: impl FnOnce(
+        KeyedStream<u32, Input, Cluster<'a, Client>, Unbounded, NoOrder>,
+    ) -> KeyedStream<u32, Output, Cluster<'a, Client>, Unbounded, NoOrder>,
+) -> KeyedStream<u32, (Output, Duration), Cluster<'a, Client>, Unbounded, NoOrder>
 where
-    Payload: Clone,
+    Input: Clone,
+    Output: Clone,
 {
-    let (c_to_proposers_complete_cycle, c_to_proposers) =
-        clients.forward_ref::<Stream<_, _, _, TotalOrder>>();
-
-    let (c_latencies, c_throughput_batches, c_new_payloads) = sliced! {
-        let mut next_virtual_client = use::state(|l| Optional::from(l.singleton(q!(0u32))));
-        let mut timers = use::state_null::<KeyedSingleton<u32, Instant, _, _>>();
-
-        let transaction_results = use(transaction_cycle(c_to_proposers).into_keyed(), nondet!(
-            /// because the transaction processor is required to handle arbitrary reordering
-            /// across *different* keys, we are safe because delaying a transaction result for a key
-            /// will only affect when the next request for that key is emitted with respect to other keys
-        ));
+    let new_payload_ids = sliced! {
+        let num_clients_per_node = use(num_clients_per_node, nondet!(/** This is a constant */));
+        let mut next_virtual_client = use::state(|l| Optional::from(l.singleton(q!((0u32, None)))));
 
         // Set up virtual clients - spawn new ones each tick until we reach the limit
         let new_virtual_client = next_virtual_client.clone();
-        next_virtual_client = new_virtual_client.clone().filter_map(
-            q!(move |virtual_id| {
+        next_virtual_client = new_virtual_client
+            .clone()
+            .zip(num_clients_per_node)
+            .filter_map(q!(move |((virtual_id, _), num_clients_per_node)| {
                 if virtual_id < num_clients_per_node as u32 {
-                    Some(virtual_id + 1)
+                    Some((virtual_id + 1, None))
                 } else {
                     None
                 }
             }),
         );
 
-        let new_virtual_client_stream = new_virtual_client.into_stream();
-
-        let c_new_payloads_on_start = new_virtual_client_stream
-            .clone()
-            .map(q!(|virtual_id| (virtual_id, None)))
-            .into_keyed();
-
-        let c_received_quorum_payloads = transaction_results
-            .map(q!(|payload| Some(payload)));
-
-        // Track statistics - timers for latency measurement
-        let c_new_timers_when_leader_elected =
-            new_virtual_client_stream.map(q!(|virtual_id| (virtual_id, Instant::now()))).into_keyed();
-        let c_updated_timers = c_received_quorum_payloads
-            .clone()
-            .map(q!(|_payload| Instant::now()));
-
-        let c_latencies = timers
-            .clone()
-            .get_many_if_present(c_updated_timers.clone())
-            .values()
-            .map(q!(
-                |(prev_time, curr_time)| curr_time.duration_since(prev_time)
-            ));
-
-        timers = timers // Update timers in tick+1 so we can record differences during this tick (to track latency)
-            .into_keyed_stream()
-            .chain(c_new_timers_when_leader_elected)
-            .chain(c_updated_timers)
-            .reduce_commutative(q!(|curr_time, new_time| {
-                if new_time > *curr_time {
-                    *curr_time = new_time;
-                }
-            }));
-
-        // Throughput tracking
-        let c_throughput_new_batch = c_received_quorum_payloads
-            .clone()
-            .values()
-            .count();
-
-        let c_new_payloads = c_new_payloads_on_start.chain(c_received_quorum_payloads);
-
-        (c_latencies, c_throughput_new_batch.into_stream(), c_new_payloads)
+        new_virtual_client.into_stream().into_keyed()
     };
 
-    let c_new_payloads = workload_generator(clients, c_new_payloads.entries());
-    c_to_proposers_complete_cycle.complete(c_new_payloads.assume_ordering::<TotalOrder>(nondet!(
-        /// We don't send a new write for the same key until the previous one is committed,
-        /// so this contains only a single write per key, and we don't care about order
-        /// across keys.
-    )));
-
-    let c_latencies = c_latencies.fold_commutative(
-        q!(move || Rc::new(RefCell::new(Histogram::<u64>::new(3).unwrap()))),
-        q!(move |latencies, latency| {
-            latencies
-                .borrow_mut()
-                .record(latency.as_nanos() as u64)
-                .unwrap();
-        }),
+    let (protocol_outputs_complete, protocol_outputs) =
+        clients.forward_ref::<KeyedStream<u32, Output, Cluster<'a, Client>, Unbounded, NoOrder>>();
+    // Use new payload IDS and previous outputs to generate new payloads
+    let protocol_inputs = workload_generator(
+        new_payload_ids.interleave(protocol_outputs.map(q!(|payload| Some(payload)))),
     );
+    // Feed new payloads to the protocol
+    let protocol_outputs = protocol(protocol_inputs.clone());
+    protocol_outputs_complete.complete(protocol_outputs.clone());
 
-    let throughput_with_timers = c_throughput_batches
-        .map(q!(|batch_size| (batch_size, false)))
-        .merge_ordered(
-            clients
-                .source_interval(q!(Duration::from_secs(1)), nondet_throughput_window)
-                .map(q!(|_| (0, true))),
-            nondet_throughput_window,
-        );
+    // Persist start latency, overwrite on new value. Memory footprint = O(num_clients_per_node)
+    let start_times = protocol_inputs
+        .reduce(q!(
+            |curr, new| {
+                *curr = new;
+            },
+            commutative = manual_proof!(/** The value will be thrown away */)
+        ))
+        .map(q!(|_input| SystemTime::now()));
 
-    let c_throughput = throughput_with_timers
-        .fold(
-            q!(|| (0, { RollingAverage::new() })),
-            q!(|(total, stats), (batch_size, reset)| {
-                if reset {
-                    if *total > 0 {
-                        stats.add_sample(*total as f64);
-                    }
+    sliced! {
+        let start_times = use(start_times, nondet!(/** Only one in-flight message per virtual client at any time, and outputs happen-after inputs, so if an output is received the start_times must contain its input time. */));
+        let current_outputs = use(protocol_outputs, nondet!(/** Batching is required to compare output to input time, but does not actually affect the result. */));
 
-                    *total = 0;
-                } else {
-                    *total += batch_size;
-                }
-            }),
-        )
-        .map(q!(|(_, stats)| stats));
+        let end_times_and_output = current_outputs
+            .assume_ordering(nondet!(/** Only one in-flight message per virtual client at any time, and they are causally dependent, so this just casts to KeyedSingleton */))
+            .reduce(
+                q!(
+                    |curr, new| {
+                        *curr = new;
+                    },
+                ),
+            )
+            .map(q!(|output| (SystemTime::now(), output)));
 
-    BenchResult {
-        latency_histogram: c_latencies,
-        throughput: c_throughput,
+        start_times
+            .defer_tick() // Get the start_times before they were overwritten with the newly generated input
+            .join_keyed_singleton(end_times_and_output)
+            .map(q!(|(start_time, (end_time, output))| (output, end_time.duration_since(start_time).unwrap())))
+            .into_keyed_stream()
+            .weaken_ordering()
     }
 }
 
-/// Prints transaction latency and throughput results to stdout,
-/// with percentiles for latency and a confidence interval for throughput.
-pub fn print_bench_results<'a, Client: 'a, Aggregator>(
-    results: BenchResult<'a, Client>,
-    aggregator: &Process<'a, Aggregator>,
+/// Computes the throughput and latency of transactions and outputs it every `interval_millis`.
+/// An output is produced even if there are no transactions.
+///
+/// # Non-Determinism
+/// This function uses non-deterministic wall-clock windows for measuring throughput.
+pub fn compute_throughput_latency<'a, Client: 'a>(
     clients: &Cluster<'a, Client>,
-) {
-    let nondet_client_count = nondet!(/** client count is stable in bench */);
-    let nondet_sampling = nondet!(/** non-deterministic samping only affects logging */);
-    let print_tick = aggregator.tick();
-    let client_members = aggregator.source_cluster_members(clients);
-    let client_count = track_membership(client_members)
-        .snapshot(&print_tick, nondet_client_count)
-        .filter(q!(|b| *b))
-        .key_count();
+    latencies: Stream<Duration, Cluster<'a, Client>, Unbounded, NoOrder>,
+    interval_millis: u64,
+    nondet_measurement_window: NonDet,
+) -> BenchResult<Cluster<'a, Client>> {
+    let punctuation = clients.source_interval(
+        q!(Duration::from_millis(interval_millis)),
+        nondet_measurement_window,
+    );
 
-    let keyed_throughputs = results
-        .throughput
-        .sample_every(q!(Duration::from_millis(1000)), nondet_sampling)
-        .send_bincode(aggregator);
+    let (interval_throughput, interval_latency) = sliced! {
+        let punctuation = use(punctuation, nondet_measurement_window);
+        let latencies = use(latencies, nondet_measurement_window);
+        let mut latency_histogram = use::state(|l| l.singleton(q!(Rc::new(RefCell::new(Histogram::<u64>::new(3).unwrap())))));
+        let mut throughput = use::state(|l| l.singleton(q!(0usize)));
 
-    let latest_throughputs = keyed_throughputs.reduce_idempotent(q!(|combined, new| {
-        *combined = new;
-    }));
+        let punctuation_option = punctuation.first();
+        let batched_latency_histogram = latencies.clone().fold(
+            q!(move || Histogram::<u64>::new(3).unwrap()),
+            q!(move |latencies, latency| {
+                    latencies
+                        .record(latency.as_nanos() as u64)
+                        .unwrap();
+                },
+                commutative = manual_proof!(/** adding elements to histogram is commutative */)
+            ),
+        );
 
-    let clients_with_throughputs_count = latest_throughputs
-        .clone()
-        .snapshot(&print_tick, nondet_client_count)
-        // Remove throughputs from clients that have yet to actually record process
-        .filter(q!(|throughputs| throughputs.sample_mean() > 0.0))
-        .key_count();
+        // Output every punctuation
+        let interval_throughput = throughput.clone().filter_if_some(punctuation_option.clone());
+        let interval_latency = latency_histogram.clone().filter_if_some(punctuation_option.clone());
 
-    let waiting_for_clients = client_count
-        .clone()
-        .zip(clients_with_throughputs_count)
-        .filter_map(q!(|(num_clients, num_clients_with_throughput)| {
-            if num_clients > num_clients_with_throughput {
-                Some(num_clients - num_clients_with_throughput)
-            } else {
-                None
-            }
-        }));
+        let batched_throughput = latencies.count();
+        // Clear every punctuation
+        let prev_throughput = throughput.filter_if_none(punctuation_option.clone());
+        // Merge new values
+        throughput = batched_throughput
+            .clone()
+            .zip(prev_throughput.clone())
+            .map(q!(|(new, old)| new + old))
+            .unwrap_or(batched_throughput.clone());
 
-    waiting_for_clients
-        .clone()
-        .all_ticks()
-        .sample_every(q!(Duration::from_millis(1000)), nondet_sampling)
-        .assume_retries(nondet!(/** extra logs due to duplicate samples are okay */))
-        .for_each(q!(|num_clients_not_responded| println!(
-            "Awaiting {} clients",
-            num_clients_not_responded
-        )));
-
-    let combined_throughputs = sliced! {
-        let latest_throughput_snapshot = use(latest_throughputs, nondet_sampling);
-        latest_throughput_snapshot
-            .values()
-            .reduce_commutative(q!(|combined, new| {
-                combined.add(new);
+        // Clear every punctuation
+        let prev_histogram = latency_histogram.filter_if_none(punctuation_option);
+        // Merge new values
+        latency_histogram = batched_latency_histogram
+            .clone()
+            .zip(prev_histogram.clone())
+            .map(q!(|(new, old)| {
+                old.borrow_mut().add(new).expect("Error adding value to histogram");
+                old
             }))
+            .unwrap_or(batched_latency_histogram.map(q!(|histogram| Rc::new(RefCell::new(histogram)))));
+
+        (interval_throughput.into_stream(), interval_latency.into_stream())
     };
 
-    combined_throughputs
-        .sample_every(q!(Duration::from_millis(1000)), nondet_sampling)
-        .batch(&print_tick, nondet_client_count)
-        .cross_singleton(client_count.clone())
-        .filter_if_none(waiting_for_clients.clone())
-        .all_ticks()
-        .assume_retries(nondet!(/** extra logs due to duplicate samples are okay */))
-        .for_each(q!(move |(throughputs, num_client_machines)| {
-            if throughputs.sample_count() >= 2 {
-                let mean = throughputs.sample_mean() * num_client_machines as f64;
+    BenchResult {
+        latency_histogram: interval_latency,
+        throughput: interval_throughput,
+    }
+}
 
-                if let Some((lower, upper)) = throughputs.confidence_interval_99() {
-                    println!(
-                        "Throughput: {:.2} - {:.2} - {:.2} requests/s",
-                        lower * num_client_machines as f64,
-                        mean,
-                        upper * num_client_machines as f64
-                    );
-                }
-            }
-        }));
+/// Returns transaction throughput and latency results.
+/// Aggregates results from clients and outputs every `output_interval_millis`.
+///
+/// Note: Inconsistent windowing may result in unexpected outputs unless `output_interval_millis` >> `interval_millis`.
+pub fn aggregate_bench_results<'a, Client: 'a, Aggregator>(
+    results: BenchResult<Cluster<'a, Client>>,
+    aggregator: &Process<'a, Aggregator>,
+    output_interval_millis: u64,
+) -> BenchResult<Process<'a, Aggregator>> {
+    let nondet_sampling = nondet!(/** non-deterministic samping only affects logging */);
+    let punctuation = aggregator.source_interval(
+        q!(Duration::from_millis(output_interval_millis)),
+        nondet_sampling,
+    );
 
-    let keyed_latencies = results
+    let a_throughputs = results
+        .throughput
+        .send(aggregator, TCP.fail_stop().bincode())
+        .values();
+
+    let a_latencies = results
         .latency_histogram
-        .sample_every(q!(Duration::from_millis(1000)), nondet_sampling)
         .map(q!(|latencies| {
             SerializableHistogramWrapper {
                 histogram: latencies,
             }
         }))
-        .send_bincode(aggregator);
+        .send(aggregator, TCP.fail_stop().bincode())
+        .values()
+        .map(q!(|wrapper| wrapper.histogram));
 
-    let most_recent_histograms = keyed_latencies
-        .map(q!(|histogram| histogram.histogram.borrow().clone()))
-        .reduce_idempotent(q!(|combined, new| {
-            // get the most recent histogram for each client
-            *combined = new;
-        }));
+    let (combined_throughputs, combined_latencies) = sliced! {
+        let punctuation = use(punctuation, nondet_sampling);
+        let a_throughputs = use(a_throughputs, nondet_sampling);
+        let a_latencies = use(a_latencies, nondet_sampling);
+        let mut latency_histogram = use::state(|l| l.singleton(q!(Rc::new(RefCell::new(Histogram::<u64>::new(3).unwrap())))));
+        let mut throughput = use::state(|l| l.singleton(q!(0usize)));
 
-    let combined_latencies = sliced! {
-        let latencies = use(most_recent_histograms, nondet_sampling);
-        latencies
-            .values()
-            .reduce_commutative(q!(|combined, new| {
-                combined.add(new).unwrap();
-            }))
+        let punctuation_option = punctuation.first();
+
+        // Output every punctuation
+        let interval_throughput = throughput.clone().filter_if_some(punctuation_option.clone());
+        let interval_latency = latency_histogram.clone().filter_if_some(punctuation_option.clone());
+
+        // Clear every punctuation
+        let prev_throughput = throughput.filter_if_none(punctuation_option.clone()).into_stream();
+        // Merge new values
+        throughput = a_throughputs
+            .chain(prev_throughput)
+            .fold(q!(|| 0usize), q!(|curr, new| {
+                    *curr += new;
+                },
+                commutative = manual_proof!(/** Addition is commutative */)
+            ));
+
+        // Merge new values
+        let merged_new_histograms = a_latencies
+            .reduce(
+                q!(|curr, new| {
+                    curr.borrow_mut().add(&*new.borrow_mut()).expect("Error adding value to histogram");
+                },
+                commutative = manual_proof!(/** Merge is commutative */)
+            ));
+        // Clear every punctuation
+        latency_histogram = latency_histogram
+            .zip(merged_new_histograms.into_singleton())
+            .zip(punctuation_option.into_singleton())
+            .map(q!(|((old, new), reset)| {
+                if reset.is_some() {
+                    // Use replace instead of clear, since interval_latency is pointing to the Histogram too
+                    old.replace(Histogram::<u64>::new(3).unwrap());
+                }
+                if let Some(new) = new {
+                    old.borrow_mut().add(&*new.borrow_mut()).expect("Error adding value to histogram");
+                }
+                old
+            }));
+
+        (interval_throughput.into_stream(), interval_latency.into_stream())
     };
 
-    combined_latencies
-        .sample_every(q!(Duration::from_millis(1000)), nondet_sampling)
-        .batch(&print_tick, nondet_client_count)
-        .filter_if_none(waiting_for_clients)
-        .all_ticks()
-        .assume_retries(nondet!(/** extra logs due to duplicate samples are okay */))
-        .for_each(q!(move |latencies| {
+    BenchResult {
+        throughput: combined_throughputs,
+        latency_histogram: combined_latencies,
+    }
+}
+
+/// Pretty prints output of `aggregate_bench_results`.
+///
+/// Prints the throughput, and the 50th, 99th, and 99.9th percentile latencies.
+pub fn pretty_print_bench_results<'a, Aggregator>(
+    aggregate_results: BenchResult<Process<'a, Aggregator>>,
+) {
+    aggregate_results.throughput.for_each(q!(|throughput| {
+        println!("Throughput: {:.2} requests/s", throughput);
+    }));
+    aggregate_results
+        .latency_histogram
+        .map(q!(move |latencies| (
+            // Convert to milliseconds but include floating point (as_millis is for whole numbers only)
+            Duration::from_nanos(latencies.borrow().value_at_quantile(0.5)).as_micros() as f64
+                / 1000.0,
+            Duration::from_nanos(latencies.borrow().value_at_quantile(0.99)).as_micros() as f64
+                / 1000.0,
+            Duration::from_nanos(latencies.borrow().value_at_quantile(0.999)).as_micros() as f64
+                / 1000.0,
+            latencies.borrow().len(),
+        )))
+        .for_each(q!(move |(p50, p99, p999, num_samples)| {
             println!(
                 "Latency p50: {:.3} | p99 {:.3} | p999 {:.3} ms ({:} samples)",
-                Duration::from_nanos(latencies.value_at_quantile(0.5)).as_micros() as f64 / 1000.0,
-                Duration::from_nanos(latencies.value_at_quantile(0.99)).as_micros() as f64 / 1000.0,
-                Duration::from_nanos(latencies.value_at_quantile(0.999)).as_micros() as f64
-                    / 1000.0,
-                latencies.len()
+                p50, p99, p999, num_samples
             );
         }));
 }

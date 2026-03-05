@@ -16,7 +16,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: "-C debuginfo=line-tables-only"
 
 defaults:
   run:
@@ -62,10 +61,10 @@ jobs:
 
       - if: matrix.rust_release == 'latest-stable' && matrix.os == 'ubuntu-latest'
         uses: ./.github/actions/use-sccache
-      
+
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo check --all-targets
-      - run: cargo check --all-targets --no-default-features
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
       - run: rustup component add --toolchain nightly rustfmt
       - run: cargo +nightly fmt --all -- --check
@@ -76,6 +75,8 @@ jobs:
     timeout-minutes: 90
     needs: pre_job
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust_release == 'latest-nightly' && 'nightly' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -90,36 +91,46 @@ jobs:
           - os: ${{ (((github.event_name != 'pull_request') || (github.event_name == 'pull_request' && (contains(github.event.pull_request.title, '[ci-full]') || contains(github.event.pull_request.body, '[ci-full]')))) && 'nothing') || 'macos-latest' }}
 
     steps:
-      - name: Maximize build space
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
-        with:
-          root-reserve-mb: 4096
-          
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install rust channel and set it as default
+      - name: Install nightly toolchain if necessary
         if: ${{ matrix.rust_release == 'latest-nightly' }}
         run: |
-          rustup toolchain add nightly && \
-          rustup default nightly
+          rustup toolchain add nightly
+
+      - name: Install targets for the current toolchain (set by RUSTUP_TOOLCHAIN env var)
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Install components for the current toolchain (set by RUSTUP_TOOLCHAIN env var)
+        run: rustup component add rustfmt clippy rust-src
 
       - if: matrix.rust_release == 'latest-stable' && matrix.os == 'ubuntu-latest'
         uses: ./.github/actions/use-sccache
 
-      - if: matrix.rust_release != 'latest-stable' || matrix.os != 'ubuntu-latest'
-        name: Install local sccache
-        uses: mozilla-actions/sccache-action@v0.0.8
+      - uses: taiki-e/install-action@nextest
 
-      - if: matrix.rust_release != 'latest-stable' || matrix.os != 'ubuntu-latest'
-        name: Set local Rust caching env vars
+      - name: Install Java for Maelstrom
+        if: matrix.os != 'windows-latest'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Download and setup Maelstrom
+        if: matrix.os != 'windows-latest'
+        run: |
+          MAELSTROM_DIR=$(mktemp -d)
+          curl -L -o "$MAELSTROM_DIR/maelstrom.tar.bz2" https://github.com/jepsen-io/maelstrom/releases/download/v0.2.4/maelstrom.tar.bz2
+          tar -xjf "$MAELSTROM_DIR/maelstrom.tar.bz2" -C "$MAELSTROM_DIR"
+          echo "MAELSTROM_PATH=$MAELSTROM_DIR/maelstrom/maelstrom" >> $GITHUB_ENV
+
+      - name: Enable Trybuild updating on nightly
+        if: ${{ matrix.rust_release == 'latest-nightly' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         uses: actions/github-script@v6
         with:
           script: |
-            core.exportVariable('RUSTC_WRAPPER', 'sccache');
-
-      - uses: taiki-e/install-action@nextest
+            core.exportVariable('TRYBUILD', 'overwrite');
 
       - name: Run cargo nextest on all targets
         id: nextest
@@ -127,13 +138,39 @@ jobs:
         env:
           INSTA_UPDATE: ${{ (matrix.rust_release == 'latest-nightly' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && 'always' || '' }}
           INSTA_FORCE_PASS: ${{ (matrix.rust_release == 'latest-nightly' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && '1' || '' }}
-        run: cargo nextest run --no-fail-fast --all-targets --features "deploy docker_deploy"
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run --no-fail-fast --all-targets --features "deploy,test_embedded"
 
       - name: Run doctests
         id: doctests
         continue-on-error: ${{ matrix.rust_release == 'latest-nightly' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         # Not supported by nextest: https://github.com/nextest-rs/nextest/issues/16
+        env:
+          # note: no-capture is not supported by doctests, that's why the unstable is needed (nightly only).
+          RUSTDOCFLAGS: ${{ matrix.rust_release == 'latest-nightly' && '-Zunstable-options --no-capture' || '' }}
+          RUST_BACKTRACE: "1"
         run: cargo test --no-fail-fast --doc
+
+      # CDK synth test - only run on ubuntu-latest with stable Rust
+      - name: Setup Node.js for CDK test
+        if: matrix.os == 'ubuntu-latest' && matrix.rust_release == 'latest-stable'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        if: matrix.os == 'ubuntu-latest' && matrix.rust_release == 'latest-stable'
+        working-directory: cdk
+        run: npm ci
+
+      - name: Run CDK synth test
+        if: matrix.os == 'ubuntu-latest' && matrix.rust_release == 'latest-stable'
+        working-directory: cdk
+        env:
+          HYDRO_DEBUG_BUILD: '1'
+        run: npm test
 
       # Nightly snapshot update logic
       - name: Check for snapshot changes (nightly only)
@@ -305,14 +342,16 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install rust channel and set it as default
+      - name: Install nightly toolchain if necessary
         if: ${{ matrix.rust_release == 'latest-nightly' }}
         run: |
-          rustup toolchain add nightly && \
-          rustup default nightly
+          rustup toolchain add nightly
 
-      - name: Install wasm target
+      - name: Install targets for the current toolchain (set by RUSTUP_TOOLCHAIN env var)
         run: rustup target add wasm32-unknown-unknown
+
+      - name: Install components for the current toolchain (set by RUSTUP_TOOLCHAIN env var)
+        run: rustup component add rustfmt clippy rust-src
 
       - name: Determine wasm-bindgen version
         id: wasm-bindgen-version

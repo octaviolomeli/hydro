@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::{ArgAction, Parser};
 use futures::SinkExt;
-use hydro_deploy::aws::AwsNetwork;
+use hydro_deploy::aws::{AwsCloudwatchLogGroup, AwsEc2IamInstanceProfile, AwsNetwork};
 use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::{Deployment, Host};
 use hydro_lang::deploy::TrybuildHost;
@@ -13,20 +13,25 @@ use tracing_subscriber::util::SubscriberInitExt;
 type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
 
 #[derive(Parser, Debug)]
+#[command(group(
+    clap::ArgGroup::new("cloud")
+        .args(&["gcp", "aws"])
+        .multiple(false)
+))]
 struct Args {
     /// Use GCP instead of localhost (requires project name)
     #[clap(long)]
     gcp: Option<String>,
 
-    /// use AWS, make sure credentials are set up
-    #[arg(short, long, action = ArgAction::SetTrue)]
+    /// Use AWS, make sure credentials are set up
+    #[arg(long, action = ArgAction::SetTrue)]
     aws: bool,
 
     #[clap(flatten)]
     graph: GraphConfig,
 }
 
-// run with no args for localhost, with `--gcp <GCP PROJECT>` for GCP, with `--aws=true` for AWS.
+// Run with no args for localhost, with `--gcp <GCP PROJECT>` for GCP, with `--aws` for AWS.
 #[tokio::main]
 async fn main() {
     let subscriber = tracing_subscriber::fmt::layer().with_target(false);
@@ -42,46 +47,51 @@ async fn main() {
     let args = Args::parse();
     let mut deployment = Deployment::new();
 
-    let (create_host, rustflags): (HostCreator, &'static str) = if let Some(project) = args.gcp {
-        let network = GcpNetwork::new(&project, None);
+    let create_host: HostCreator = if let Some(project) = &args.gcp {
+        let network = GcpNetwork::new(project, None);
+        let project = project.clone();
 
-        (
-            Box::new(move |deployment| -> Arc<dyn Host> {
-                deployment
-                    .GcpComputeEngineHost()
-                    .project(&project)
-                    .machine_type("e2-micro")
-                    .image("debian-cloud/debian-11")
-                    .region("us-west1-a")
-                    .network(network.clone())
-                    .add()
-            }),
-            "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off",
-        )
+        Box::new(move |deployment| -> Arc<dyn Host> {
+            deployment
+                .GcpComputeEngineHost()
+                .project(&project)
+                .machine_type("e2-micro")
+                .image("debian-cloud/debian-11")
+                .region("us-west1-a")
+                .network(network.clone())
+                .add()
+        })
     } else if args.aws {
-        let network = AwsNetwork::new("us-east-1", None);
+        let region = "us-east-1";
+        let network = AwsNetwork::new(region, None);
+        let iam_instance_profile = Arc::new(Mutex::new(
+            AwsEc2IamInstanceProfile::new(region, None).add_cloudwatch_agent_server_policy_arn(),
+        ));
+        let cloudwatch_log_group = Arc::new(Mutex::new(AwsCloudwatchLogGroup::new(region, None)));
 
-        (
-            Box::new(move |deployment| -> Arc<dyn Host> {
-                deployment
-                    .AwsEc2Host()
-                    .region("us-east-1")
-                    .instance_type("t3.micro")
-                    .ami("ami-0e95a5e2743ec9ec9") // Amazon Linux 2
-                    .network(network.clone())
-                    .add()
-            }),
-            "-C opt-level=3 -C codegen-units=1 -C strip=debuginfo -C debuginfo=0 -C lto=off",
-        )
+        Box::new(move |deployment| -> Arc<dyn Host> {
+            deployment
+                .AwsEc2Host()
+                .region(region)
+                .instance_type("t3.micro")
+                .ami("ami-0e95a5e2743ec9ec9") // Amazon Linux 2
+                .network(network.clone())
+                .iam_instance_profile(iam_instance_profile.clone())
+                .cloudwatch_log_group(cloudwatch_log_group.clone())
+                .add()
+        })
     } else {
         let localhost = deployment.Localhost();
-        (
-            Box::new(move |_| -> Arc<dyn Host> { localhost.clone() }),
-            "",
-        )
+        Box::new(move |_| -> Arc<dyn Host> { localhost.clone() })
     };
 
-    let builder = hydro_lang::compile::builder::FlowBuilder::new();
+    let rustflags = if args.gcp.is_some() || args.aws {
+        "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off -C link-args=--no-rosegment"
+    } else {
+        "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
+    };
+
+    let mut builder = hydro_lang::compile::builder::FlowBuilder::new();
     let external = builder.external();
     let p1 = builder.process();
     let p2 = builder.process();
@@ -143,7 +153,9 @@ fn test() {
     run.read_string(
         "Enter characters and press enter to send them over the network (ctrl-d to stop):",
     );
-    run.read_string("[hydro_test::distributed::first_ten::P2 (process 2)] 9");
+    run.read_string("[hydro_test::distributed::first_ten::P2 (process loc3v1)] 9");
     run.write_line("Hello World");
-    run.read_string(r#"[hydro_test::distributed::first_ten::P1 (process 1)] hi: "Hello World\n"#);
+    run.read_string(
+        r#"[hydro_test::distributed::first_ten::P1 (process loc2v1)] hi: "Hello World\n"#,
+    );
 }

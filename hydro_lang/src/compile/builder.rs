@@ -3,6 +3,8 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use slotmap::{SecondaryMap, SlotMap};
+
 #[cfg(feature = "build")]
 use super::compiled::CompiledFlow;
 #[cfg(feature = "build")]
@@ -10,11 +12,30 @@ use super::deploy::{DeployFlow, DeployResult};
 #[cfg(feature = "build")]
 use super::deploy_provider::{ClusterSpec, Deploy, ExternalSpec, IntoProcessSpec};
 use super::ir::HydroRoot;
-use crate::location::{Cluster, External, Process};
+use crate::location::{Cluster, External, LocationKey, LocationType, Process};
 #[cfg(feature = "sim")]
 #[cfg(stageleft_runtime)]
 use crate::sim::flow::SimFlow;
 use crate::staging_util::Invariant;
+
+#[stageleft::export(ExternalPortId, CycleId, ClockId)]
+crate::newtype_counter! {
+    /// ID for an external output.
+    pub struct ExternalPortId(usize);
+
+    /// ID for a [`crate::location::Location::forward_ref`] cycle.
+    pub struct CycleId(usize);
+
+    /// ID for clocks (ticks).
+    pub struct ClockId(usize);
+}
+
+impl CycleId {
+    #[cfg(feature = "build")]
+    pub(crate) fn as_ident(&self) -> syn::Ident {
+        syn::Ident::new(&format!("cycle_{}", self), proc_macro2::Span::call_site())
+    }
+}
 
 pub(crate) type FlowState = Rc<RefCell<FlowStateInner>>;
 
@@ -22,23 +43,29 @@ pub(crate) struct FlowStateInner {
     /// Tracks the roots of the dataflow IR. This is referenced by
     /// `Stream` and `HfCycle` to build the IR. The inner option will
     /// be set to `None` when this builder is finalized.
-    pub(crate) roots: Option<Vec<HydroRoot>>,
+    roots: Option<Vec<HydroRoot>>,
 
     /// Counter for generating unique external output identifiers.
-    pub(crate) next_external_out: usize,
+    next_external_port: ExternalPortId,
 
     /// Counters for generating identifiers for cycles.
-    pub(crate) cycle_counts: usize,
+    next_cycle_id: CycleId,
 
     /// Counters for clock IDs.
-    pub(crate) next_clock_id: usize,
+    next_clock_id: ClockId,
 }
 
 impl FlowStateInner {
-    pub fn next_cycle_id(&mut self) -> usize {
-        let id = self.cycle_counts;
-        self.cycle_counts += 1;
-        id
+    pub fn next_external_port(&mut self) -> ExternalPortId {
+        self.next_external_port.get_and_increment()
+    }
+
+    pub fn next_cycle_id(&mut self) -> CycleId {
+        self.next_cycle_id.get_and_increment()
+    }
+
+    pub fn next_clock_id(&mut self) -> ClockId {
+        self.next_clock_id.get_and_increment()
     }
 
     pub fn push_root(&mut self, root: HydroRoot) {
@@ -49,14 +76,21 @@ impl FlowStateInner {
     }
 }
 
-#[expect(missing_docs, reason = "TODO")]
 pub struct FlowBuilder<'a> {
+    /// Hydro IR and associated counters
     flow_state: FlowState,
-    processes: RefCell<Vec<(usize, String)>>,
-    clusters: RefCell<Vec<(usize, String)>>,
-    externals: RefCell<Vec<(usize, String)>>,
 
-    next_location_id: RefCell<usize>,
+    /// Locations and their type.
+    locations: SlotMap<LocationKey, LocationType>,
+    /// Map from raw location ID to name (including externals).
+    location_names: SecondaryMap<LocationKey, String>,
+
+    /// Application name used in telemetry.
+    #[cfg_attr(
+        not(feature = "build"),
+        expect(dead_code, reason = "unused without build")
+    )]
+    flow_name: String,
 
     /// Tracks whether this flow has been finalized; it is an error to
     /// drop without finalizing.
@@ -81,47 +115,35 @@ impl Drop for FlowBuilder<'_> {
 
 #[expect(missing_docs, reason = "TODO")]
 impl<'a> FlowBuilder<'a> {
+    /// Creates a new `FlowBuilder` to construct a Hydro program, using the Cargo package name as the program name.
     #[expect(
         clippy::new_without_default,
         reason = "call `new` explicitly, not `default`"
     )]
-    pub fn new() -> FlowBuilder<'a> {
-        FlowBuilder {
-            flow_state: Rc::new(RefCell::new(FlowStateInner {
-                roots: Some(vec![]),
-                next_external_out: 0,
-                cycle_counts: 0,
-                next_clock_id: 0,
-            })),
-            processes: RefCell::new(vec![]),
-            clusters: RefCell::new(vec![]),
-            externals: RefCell::new(vec![]),
-            next_location_id: RefCell::new(0),
-            finalized: false,
-            _phantom: PhantomData,
+    pub fn new() -> Self {
+        let mut name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".to_owned());
+        if let Ok(bin_path) = std::env::current_exe()
+            && let Some(bin_name) = bin_path.file_stem()
+        {
+            name = format!("{}/{}", name, bin_name.display());
         }
+        Self::with_name(name)
     }
 
-    pub fn rewritten_ir_builder<'b>(&self) -> RewriteIrFlowBuilder<'b> {
-        let processes = self.processes.borrow().clone();
-        let clusters = self.clusters.borrow().clone();
-        let externals = self.externals.borrow().clone();
-        let next_location_id = *self.next_location_id.borrow();
-        RewriteIrFlowBuilder {
-            builder: FlowBuilder {
-                flow_state: Rc::new(RefCell::new(FlowStateInner {
-                    roots: None,
-                    next_external_out: 0,
-                    cycle_counts: 0,
-                    next_clock_id: 0,
-                })),
-                processes: RefCell::new(processes),
-                clusters: RefCell::new(clusters),
-                externals: RefCell::new(externals),
-                next_location_id: RefCell::new(next_location_id),
-                finalized: false,
-                _phantom: PhantomData,
-            },
+    /// Creates a new `FlowBuilder` to construct a Hydro program, with the given program name.
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            flow_state: Rc::new(RefCell::new(FlowStateInner {
+                roots: Some(vec![]),
+                next_external_port: ExternalPortId::default(),
+                next_cycle_id: CycleId::default(),
+                next_clock_id: ClockId::default(),
+            })),
+            locations: SlotMap::with_key(),
+            location_names: SecondaryMap::new(),
+            flow_name: name.into(),
+            finalized: false,
+            _phantom: PhantomData,
         }
     }
 
@@ -129,49 +151,31 @@ impl<'a> FlowBuilder<'a> {
         &self.flow_state
     }
 
-    pub fn process<P>(&self) -> Process<'a, P> {
-        let mut next_location_id = self.next_location_id.borrow_mut();
-        let id = *next_location_id;
-        *next_location_id += 1;
-
-        self.processes
-            .borrow_mut()
-            .push((id, type_name::<P>().to_string()));
-
+    pub fn process<P>(&mut self) -> Process<'a, P> {
+        let key = self.locations.insert(LocationType::Process);
+        self.location_names.insert(key, type_name::<P>().to_owned());
         Process {
-            id,
+            key,
             flow_state: self.flow_state().clone(),
             _phantom: PhantomData,
         }
     }
 
-    pub fn external<P>(&self) -> External<'a, P> {
-        let mut next_location_id = self.next_location_id.borrow_mut();
-        let id = *next_location_id;
-        *next_location_id += 1;
-
-        self.externals
-            .borrow_mut()
-            .push((id, type_name::<P>().to_string()));
-
-        External {
-            id,
-            flow_state: self.flow_state().clone(),
-            _phantom: PhantomData,
-        }
-    }
-
-    pub fn cluster<C>(&self) -> Cluster<'a, C> {
-        let mut next_location_id = self.next_location_id.borrow_mut();
-        let id = *next_location_id;
-        *next_location_id += 1;
-
-        self.clusters
-            .borrow_mut()
-            .push((id, type_name::<C>().to_string()));
-
+    pub fn cluster<C>(&mut self) -> Cluster<'a, C> {
+        let key = self.locations.insert(LocationType::Cluster);
+        self.location_names.insert(key, type_name::<C>().to_owned());
         Cluster {
-            id,
+            key,
+            flow_state: self.flow_state().clone(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn external<E>(&mut self) -> External<'a, E> {
+        let key = self.locations.insert(LocationType::External);
+        self.location_names.insert(key, type_name::<E>().to_owned());
+        External {
+            key,
             flow_state: self.flow_state().clone(),
             _phantom: PhantomData,
         }
@@ -187,9 +191,9 @@ impl<'a> FlowBuilder<'a> {
 
         super::built::BuiltFlow {
             ir: self.flow_state.borrow_mut().roots.take().unwrap(),
-            process_id_name: self.processes.replace(vec![]),
-            cluster_id_name: self.clusters.replace(vec![]),
-            external_id_name: self.externals.replace(vec![]),
+            locations: std::mem::take(&mut self.locations),
+            location_names: std::mem::take(&mut self.location_names),
+            flow_name: std::mem::take(&mut self.flow_name),
             _phantom: PhantomData,
         }
     }
@@ -247,12 +251,8 @@ impl<'a> FlowBuilder<'a> {
         self.with_default_optimize().with_remaining_clusters(spec)
     }
 
-    pub fn compile<D: Deploy<'a>>(self) -> CompiledFlow<'a, D::GraphId> {
+    pub fn compile<D: Deploy<'a, InstantiateEnv = ()>>(self) -> CompiledFlow<'a> {
         self.with_default_optimize::<D>().compile()
-    }
-
-    pub fn compile_no_network<D: Deploy<'a>>(self) -> CompiledFlow<'a, D::GraphId> {
-        self.with_default_optimize::<D>().compile_no_network()
     }
 
     pub fn deploy<D: Deploy<'a>>(self, env: &mut D::InstantiateEnv) -> DeployResult<'a, D> {
@@ -265,21 +265,25 @@ impl<'a> FlowBuilder<'a> {
     pub fn sim(self) -> SimFlow<'a> {
         self.finalize().sim()
     }
-}
 
-#[expect(missing_docs, reason = "TODO")]
-pub struct RewriteIrFlowBuilder<'a> {
-    builder: FlowBuilder<'a>,
-}
+    pub fn from_built<'b>(built: &super::built::BuiltFlow) -> FlowBuilder<'b> {
+        FlowBuilder {
+            flow_state: Rc::new(RefCell::new(FlowStateInner {
+                roots: None,
+                next_external_port: ExternalPortId::default(),
+                next_cycle_id: CycleId::default(),
+                next_clock_id: ClockId::default(),
+            })),
+            locations: built.locations.clone(),
+            location_names: built.location_names.clone(),
+            flow_name: built.flow_name.clone(),
+            finalized: false,
+            _phantom: PhantomData,
+        }
+    }
 
-#[expect(missing_docs, reason = "TODO")]
-impl<'a> RewriteIrFlowBuilder<'a> {
-    pub fn build_with(
-        self,
-        thunk: impl FnOnce(&FlowBuilder<'a>) -> Vec<HydroRoot>,
-    ) -> FlowBuilder<'a> {
-        let roots = thunk(&self.builder);
-        self.builder.flow_state().borrow_mut().roots = Some(roots);
-        self.builder
+    #[doc(hidden)] // TODO(mingwei): This is an unstable API for now
+    pub fn replace_ir(&mut self, roots: Vec<HydroRoot>) {
+        self.flow_state.borrow_mut().roots = Some(roots);
     }
 }
