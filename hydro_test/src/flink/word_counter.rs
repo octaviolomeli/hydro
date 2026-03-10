@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn test_word_counter() {
-        let flow = FlowBuilder::new();
+        let mut flow = FlowBuilder::new();
         let process = flow.process::<WordServer>();
 
         let (texts_in_port, texts_stream) = process.sim_input();

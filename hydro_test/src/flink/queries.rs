@@ -1,43 +1,43 @@
-use chrono::{DateTime, Timelike, Utc};
-use hydro_lang::{live_collections::stream::{NoOrder, TotalOrder}, prelude::*};
+use hydro_lang::{live_collections::stream::{NoOrder, TotalOrder}, prelude::*, live_collections::keyed_singleton::BoundedValue};
+use serde::{Deserialize, Serialize};
 
 pub struct Queries;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub struct Auction {
-    id: i64,
-    item_name: String,
-    description: String,
-    initial_bid: i64,
-    reserve: i64,
-    date_time: DateTime<Utc>,
-    expires: DateTime<Utc>,
-    seller: i64,
-    category: i64,
-    extra: String
+    pub id: i64,
+    pub item_name: String,
+    pub description: String,
+    pub initial_bid: i64,
+    pub reserve: i64,
+    pub date_time: i64,
+    pub expires: i64,
+    pub seller: i64,
+    pub category: i64,
+    pub extra: String
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub struct Person {
-    id: i64,
-    name: String,
-    email: String,
-    credit_card: String,
-    city: String,
-    state: String,
-    date_time: DateTime<Utc>,
-    extra: String
+    pub id: i64,
+    pub name: String,
+    pub email: String,
+    pub credit_card: String,
+    pub city: String,
+    pub state: String,
+    pub date_time: i64,
+    pub extra: String
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub struct Bid {
-    auction: i64,
-    bidder: i64,
-    price: i64,
-    channel: String,
-    url: String,
-    date_time: DateTime<Utc>,
-    extra: String
+    pub auction: i64,
+    pub bidder: i64,
+    pub price: i64,
+    pub channel: String,
+    pub url: String,
+    pub date_time: i64,
+    pub extra: String
 }
 
 /*
@@ -45,8 +45,8 @@ pub struct Bid {
 */
 
 pub fn q1<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<Bid, Process<'a, Queries>, Bounded> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
+) -> Stream<Bid, Process<'a, Queries>, Unbounded> {
     /*
         Convert each bid value from dollars to euros. Illustrates a simple transformation.
     */
@@ -57,8 +57,8 @@ pub fn q1<'a>(
 }
 
 pub fn q2<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<(i64, i64), Process<'a, Queries>, Bounded> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
+) -> Stream<(i64, i64), Process<'a, Queries>, Unbounded> {
     /*
         Find bids with specific auction ids and show their bid price.
     */
@@ -72,9 +72,9 @@ pub fn q2<'a>(
 }
 
 pub fn q3<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Bounded>,
-    person_stream: Stream<Person, Process<'a, Queries>, Bounded>,
-) -> Stream<(String, String, String, i64), Process<'a, Queries>, Bounded, NoOrder> {
+    auction_stream: Stream<Auction, Process<'a, Queries>, Unbounded>,
+    person_stream: Stream<Person, Process<'a, Queries>, Unbounded>,
+) -> Stream<(String, String, String, i64), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         Who is selling in OR, ID or CA in category 10, and for what auction ids?
         Illustrates an incremental join (using per-key state and timer) and filter.
@@ -103,18 +103,18 @@ pub fn q3<'a>(
 }
 
 pub fn q4<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Bounded>,
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<(i64, i64), Process<'a, Queries>, Bounded, NoOrder> {
+    auction_stream: Stream<Auction, Tick<Process<'a, Queries>>, Bounded>,
+    bid_stream: Stream<Bid, Tick<Process<'a, Queries>>, Bounded>,
+) -> KeyedSingleton<i64, i64, Process<'a, Queries>, Unbounded> {
     /*
         Select the average of the wining bid prices for all auctions in each category.
-        Illustrates complex join and aggregation.
+        Illustrates join and aggregation.
     */
 
     let formatted_auctions = auction_stream.map(q!(|a| (a.id, a)));
     let formatted_bids = bid_stream.map(q!(|b| (b.auction, b)));
 
-    let joined = formatted_auctions.join(formatted_bids).filter_map(q!(|a_b| {
+    let join = formatted_auctions.join(formatted_bids).filter_map(q!(|a_b| {
         let (a, b) = a_b.1;
         if a.date_time <= b.date_time && b.date_time <= a.expires {
             Some(((a.id, a.category), b.price))
@@ -123,19 +123,19 @@ pub fn q4<'a>(
         }
     }));
 
-    let max_price_by_auction = joined.into_keyed().reduce_commutative(q!(|winning_a_bid, cur| {
+    let max_price_by_auction = join.into_keyed().assume_ordering::<TotalOrder>(nondet!(/** TODO **/)).reduce(q!(|winning_a_bid, cur| {
         if *winning_a_bid < cur {
             *winning_a_bid = cur;
         }
     }));
 
-    let aggregated_categories = max_price_by_auction.entries().map(q!(|elem| {
+    let aggregated_categories = max_price_by_auction.entries().all_ticks().map(q!(|elem| {
         let category = elem.0.1;
         let max_price = elem.1;
         (category, (max_price, 1))
     })).into_keyed();
 
-    let summed_prices_by_category = aggregated_categories.reduce_commutative(q!(|acc_prices, x| {
+    let summed_prices_by_category = aggregated_categories.assume_ordering::<TotalOrder>(nondet!(/** TODO **/)).reduce(q!(|acc_prices, x| {
         acc_prices.0 += x.0;
         acc_prices.1 += x.1;
     }));
@@ -146,14 +146,15 @@ pub fn q4<'a>(
        summed_prices / num_prices
     }));
 
-    average_winning_price_by_category.entries()
+    average_winning_price_by_category
 
 }
 
+// fix
 pub fn q6<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Bounded>,
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<(i64, i64), Process<'a, Queries>, Bounded, NoOrder> {
+    auction_stream: Stream<Auction, Tick<Process<'a, Queries>>, Bounded>,
+    bid_stream: Stream<Bid, Tick<Process<'a, Queries>>, Bounded>
+) -> Stream<(i64, i64), Tick<Process<'a, Queries>>, Bounded, NoOrder> {
     /*
         What is the average selling price per seller for their last 10 closed auctions.
         Illustrates a specialized combiner
@@ -170,7 +171,11 @@ pub fn q6<'a>(
         }
     })).sort(); // Sort by price descending
 
-    let groupby_idseller = subquery.assume_ordering::<TotalOrder>(nondet!(/** Sorted */)).map(q!(|(price, id, seller, date)| ((id, seller), (-price, date)))).into_keyed();
+    let groupby_idseller = subquery
+        .assume_ordering::<TotalOrder>(nondet!(/** Sorted */))
+        .map(q!(|(price, id, seller, date)| ((id, seller), (-price, date))))
+        .into_keyed();
+
     let where_aggregation = groupby_idseller.scan(q!(|| 0), q!(|acc, data| {
             *acc += 1;
             if *acc == 1 {
@@ -179,6 +184,7 @@ pub fn q6<'a>(
                 None
             }
         }));
+
     let from = where_aggregation.entries().map(q!(|((_, seller), (price, date))| (seller, (date, price)))).sort();
     
     // Calculating average of current row and last 10
@@ -199,15 +205,16 @@ pub fn q6<'a>(
 }
 
 pub fn q7<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<Bid, Process<'a, Queries>, Bounded, NoOrder> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
+) -> Stream<Bid, Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         What are the highest bids per period of 10 seconds?
     */
-    
+    let tick = bid_stream.clone().location().tick();
+
     let window_stream = bid_stream.clone().map(q!(|b| {
         let window_size = 10;
-        let seconds = b.date_time.timestamp();
+        let seconds = b.date_time;
         let window_start = seconds - (seconds % window_size);
         let window_end = window_start + window_size;
 
@@ -216,12 +223,17 @@ pub fn q7<'a>(
 
     let aggregation = window_stream
         .into_keyed()
-        .reduce_commutative(q!(|acc, price| {
+        .reduce(q!(|acc, price| {
             if *acc < price {
                 *acc = price;
             }
     }));
-    let prepared_join = aggregation.entries().map(q!(|(k, v)| (v, v)));
+    let prepared_join = aggregation
+        .snapshot(&tick, nondet!(/** test **/))
+        .entries()
+        .all_ticks()
+        .map(q!(|(_, v)| (v, v)));
+
     let prepared_bids = bid_stream.map(q!(|b| (b.price, b)));
     let join = prepared_bids.join(prepared_join);
     let select = join.map(q!(|(_, (bid, _))| bid));
@@ -230,16 +242,17 @@ pub fn q7<'a>(
 }
 
 pub fn q8<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Bounded>,
-    person_stream: Stream<Person, Process<'a, Queries>, Bounded>
-) -> Stream<(i64, String, i64, i64), Process<'a, Queries>, Bounded, NoOrder> {
+    auction_stream: Stream<Auction, Process<'a, Queries>, Unbounded>,
+    person_stream: Stream<Person, Process<'a, Queries>, Unbounded>
+) -> Stream<(i64, String, i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
-        Select people who have entered the system and created auctions in the last period of 10 seconds.
+        Select people who have entered the system and created auctions in the last period.
     */
+    let tick = auction_stream.clone().location().tick();
     
     let person_window_stream = person_stream.clone().map(q!(|p| {
         let window_size = 10;
-        let seconds = p.date_time.timestamp();
+        let seconds = p.date_time;
         let window_start = seconds - (seconds % window_size);
         let window_end = window_start + window_size;
 
@@ -248,7 +261,7 @@ pub fn q8<'a>(
 
     let auction_window_stream = auction_stream.clone().map(q!(|a| {
         let window_size = 10;
-        let seconds = a.date_time.timestamp();
+        let seconds = a.date_time;
         let window_start = seconds - (seconds % window_size);
         let window_end = window_start + window_size;
 
@@ -257,24 +270,34 @@ pub fn q8<'a>(
 
     let auction_aggregation = auction_window_stream
         .into_keyed()
-        .reduce_commutative(q!(|acc, _| {}));
+        .reduce(q!(|_, _| {}));
 
     let person_aggregation = person_window_stream
         .into_keyed()
-        .reduce_commutative(q!(|acc, _| {}));
+        .reduce(q!(|_, _| {}));
 
-    let prepared_a_join = auction_aggregation.entries().map(q!(|(k, _)| (k, k)));
-    let prepared_p_join = person_aggregation.entries().map(q!(|(k, _)| ((k.0, k.2, k.3), k)));
+    let prepared_a_join = auction_aggregation
+        .snapshot(&tick, nondet!(/** test **/))
+        .entries()
+        .all_ticks()
+        .map(q!(|(k, _)| (k, k)));
+
+    let prepared_p_join = person_aggregation
+        .snapshot(&tick, nondet!(/** test **/))
+        .entries()
+        .all_ticks()
+        .map(q!(|(k, _)| ((k.0, k.2, k.3), k)));
     let join = prepared_a_join.join(prepared_p_join);
-    let select = join.map(q!(|(k, v)| v.1));
+    let select = join.map(q!(|(_, v)| v.1));
     select
     
 }
 
+// fix
 pub fn q9<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Bounded>,
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>
-) -> Stream<(i64, String, i64, DateTime<Utc>), Process<'a, Queries>, Bounded, NoOrder> {
+    auction_stream: Stream<Auction, Tick<Process<'a, Queries>>, Bounded>,
+    bid_stream: Stream<Bid, Tick<Process<'a, Queries>>, Bounded>
+) -> KeyedSingleton<i64, (i64, String, i64, i64), Tick<Process<'a, Queries>>, Bounded>{
     /*
         Find the winning bid for each auction.
     */
@@ -290,32 +313,21 @@ pub fn q9<'a>(
         }
     }));
 
-    let sort_price_groupby_id = datetime_filter.sort()
+    let sort_price_groupby_id = datetime_filter
+        .sort()
         .map(q!(|(price, date, id, item)| (id, (id, item, -price, date))))
         .assume_ordering::<TotalOrder>(nondet!(/** Sorted */))
         .into_keyed();
 
-    // Within each group, assign a row number to the entries
-    let aggregation = sort_price_groupby_id.assume_ordering::<TotalOrder>(nondet!(/** Sorted */))
-        .scan(q!(|| 0), q!(|acc, data| {
-            *acc += 1;
-            Some((*acc, data))
-        }));
+    let aggregation = sort_price_groupby_id.assume_ordering::<TotalOrder>(nondet!(/** Sorted */)).first();
     
-    let from = aggregation.entries().filter_map(q!(|(_, (row_num, data))| {
-        if row_num <= 1 {
-            Some(data)
-        } else {
-            None
-        }
-    }));
-
-    from
+    aggregation
 }
 
+// fix
 pub fn q11<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<(i64, i32, DateTime<Utc>, DateTime<Utc>), Process<'a, Queries>, Bounded, NoOrder> {
+    bid_stream: Stream<Bid, Tick<Process<'a, Queries>>, Bounded>,
+) -> Stream<(i64, i32, i64, i64), Tick<Process<'a, Queries>>, Bounded, NoOrder> {
     /*
         How many bids did a user make in each session they were active? Illustrates session windows.
         Group bids by the same user into sessions with max session gap.
@@ -335,7 +347,7 @@ pub fn q11<'a>(
                     // Update current session or make new one
                     let elapsed = current_time - *last;
 
-                    if elapsed.num_seconds() <= 10 {
+                    if elapsed <= 10 {
                         *last = current_time;
                         *count += 1;
                         None
@@ -353,8 +365,8 @@ pub fn q11<'a>(
 }
 
 pub fn q14<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<(i64, i64, f64, String, DateTime<Utc>, String, i64), Process<'a, Queries>, Bounded> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
+) -> Stream<(i64, i64, f64, String, i64, String, i64), Process<'a, Queries>, Unbounded> {
     /*
         Convert bid timestamp into types and find bids with specific price.
         Illustrates duplicate expressions and usage of user-defined-functions.
@@ -362,7 +374,7 @@ pub fn q14<'a>(
     bid_stream.filter_map(q!(|bid| {
         if bid.price as f64 * 0.908 > 1000000.0 && bid.price as f64 * 0.908 < 50000000.0 {
             let mut bid_time_type = "otherTime";
-            let bid_hour = bid.date_time.hour();
+            let bid_hour = bid.date_time; // Using just seconds for testing
             if bid_hour >= 8 && bid_hour <= 18 {
                 bid_time_type = "dayTime";
             } else if bid_hour <= 6 || bid_hour >= 20 {
@@ -385,72 +397,79 @@ pub fn q14<'a>(
 }
 
 pub fn q17<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>
-) -> Stream<(i64, String, i64, i64, i64, i64, i64, i64, i64, i64), Process<'a, Queries>, Bounded, NoOrder> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>
+) -> KeyedSingleton<(i64, i64), (i64, i64, i64, i64, i64, i32, i64, i64, i64, i64), Process<'a, Queries>, Unbounded>{
     /*
         How many bids on an auction made a day and what is the price?
         Illustrates an unbounded group aggregation.
     */
-    let grouped_auction_day = bid_stream.map(q!(|bid| ((bid.auction, bid.date_time.format("%Y/%m/%d").to_string()), bid.price))).into_keyed();
-    let aggregation = grouped_auction_day.fold_commutative(q!(|| (0, 0, 0, 0, 0, 0, 0, 0)), q!(|acc, bid_price| {
+    let grouped_auction_day = bid_stream.map(q!(|bid| ((bid.auction, bid.date_time), bid.price))).into_keyed();
+    let aggregation = grouped_auction_day.fold(q!(|| (0, 0, 0, 0, i64::MAX, i64::MIN, 0, 0)), q!(|acc, bid_price| {
         acc.0 += 1;
         acc.1 += if bid_price < 10000 { 1 } else { 0 };
         acc.2 += if bid_price >= 10000 && bid_price < 1000000 { 1 } else { 0 };
         acc.3 += if bid_price >= 1000000 { 1 } else { 0 };
         acc.4 = if bid_price < acc.4 { bid_price } else { acc.4 };
-        acc.5 = if bid_price > acc.4 { bid_price } else { acc.4 };
+        acc.5 = if bid_price > acc.5 { bid_price } else { acc.5 };
         acc.6 += bid_price;
         acc.7 += bid_price;
     }));
-    let select = aggregation.entries().map(q!(|(auction_day, agg)| (
-        auction_day.0,
-        auction_day.1,
-        agg.0,
-        agg.1,
-        agg.2,
-        agg.3,
-        agg.4,
-        agg.5,
-        agg.6 / agg.0,
-        agg.7
-    )));
+    
+    let select = aggregation.map_with_key(q!(|(key, data)| {
+        ( key.0, key.1, data.0, data.1, data.2, data.3, data.4, data.5, data.6 / data.0, data.7 )
+    }));
+
     select
 }
 
 pub fn q18<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>
-) -> Stream<(DateTime<Utc>, i64), Process<'a, Queries>, Bounded, NoOrder> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>
+) -> KeyedSingleton<(i64, i64), (i64, i64, i64, i64, i32), Process<'a, Queries>, Unbounded>{
     /*
         What's a's last bid for bidder to auction?
     */
-    let sorted_datetime = bid_stream.map(q!(|bid| (bid.date_time, bid.bidder, bid.auction, bid.price))).sort().map(q!(|(d, b, a, p)| ((b, a), (d, p))));
+    let tick = bid_stream.clone().location().tick();
+
+    let sorted_datetime = bid_stream.batch(&tick, nondet!(/** test **/))
+        .map(q!(|bid| (bid.date_time, bid.bidder, bid.auction, bid.price)))
+        .sort()
+        .all_ticks()
+        .map(q!(|(d, b, a, p)| ((b, a), (d, p))));
+
     let grouped_bidder_auction = sorted_datetime.assume_ordering::<TotalOrder>(nondet!(/** Sorted */)).into_keyed();
 
     // Within each group, assign a row number to the entries
-    let aggregation = grouped_bidder_auction.assume_ordering::<TotalOrder>(nondet!(/** Sorted */)).scan(q!(|| 0), q!(|acc, (datetime, price)| {
+    let aggregation = grouped_bidder_auction.assume_ordering::<TotalOrder>(nondet!(/** Sorted */))
+    .scan(q!(|| 0), q!(|acc, (datetime, price)| {
         *acc += 1;
         Some((*acc, (datetime, price)))
     }));
     
-    let from = aggregation.entries().filter_map(q!(|(_, (row_num, data))| {
+    let from = aggregation.reduce(q!(|acc, (row_num, data)| {
         if row_num <= 1 {
-            Some(data)
-        } else {
-            None
+            *acc = (acc.0 + row_num, data);
         }
+    }))
+    .map_with_key(q!(|((bidder, auction), (n, data))| {
+        (bidder, auction, data.0, data.1, n)
     }));
 
     from
 }
 
+// fix
 pub fn q19<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>
-) -> Stream<(i64, i64, i64), Process<'a, Queries>, Bounded, NoOrder> {
+    bid_stream: Stream<Bid, Tick<Process<'a, Queries>>, Bounded>
+) -> Stream<(i32, i64, i64), Tick<Process<'a, Queries>>, Bounded, NoOrder> {
     /*
         What's the top price 10 bids of an auction?
         Illustrates a TOP-N query.
     */
-    let sorted_price = bid_stream.map(q!(|bid| (-bid.price, bid.auction))).sort().map(q!(|(p, a)| (a, -p)));
+
+    let sorted_price = bid_stream.map(q!(|bid| (bid.price, bid.auction)))
+        .sort()
+        .map(q!(|(p, a)| (a, p)));
+
     let grouped_bidder_auction = sorted_price.assume_ordering::<TotalOrder>(nondet!(/** Sorted */)).into_keyed();
 
     // Within each group, assign a row number to the entries
@@ -465,18 +484,18 @@ pub fn q19<'a>(
         } else {
             None
         }
-        
     }));
 
     from
 }
 
 pub fn q20<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-    auction_stream: Stream<Auction, Process<'a, Queries>, Bounded>,
-) -> Stream<(i64, i64, i64, String, String, DateTime<Utc>, String, String, String, i64, i64, DateTime<Utc>, DateTime<Utc>, i64, i64, String), Process<'a, Queries>, Bounded, NoOrder> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
+    auction_stream: Stream<Auction, Process<'a, Queries>, Unbounded>,
+) -> Stream<(i64, i64, String, i64, i64, i64), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
-        Convert each bid value from dollars to euros. Illustrates a simple transformation.
+        Get bids with the corresponding auction information where category is 10.
+        Illustrates a filter join.
     */
     let cat_10_auctions = auction_stream.filter_map(q!(|a| {
         if  a.category == 10 {
@@ -491,14 +510,12 @@ pub fn q20<'a>(
     let select = join.map(q!(|elem| {
         let (a, b) = elem.1;
         (
-            b.auction, b.bidder, b.price, b.channel, b.url, b.date_time, b.extra,
-            a.item_name, a.description, a.initial_bid, a.reserve, a.date_time, a.expires,
-            a.seller, a.category, a.extra
+            b.auction, b.date_time,
+            a.item_name, a.date_time, a.seller, a.category
         )
     }));
 
     select
-
 }
 
 // pub fn q21<'a>(
@@ -527,8 +544,8 @@ pub fn q20<'a>(
 // }
 
 pub fn q22<'a>(
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-) -> Stream<(i64, i64, i64, String, String, String, String), Process<'a, Queries>, Bounded> {
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
+) -> Stream<(i64, i64, i64, String, String, String, String), Process<'a, Queries>, Unbounded> {
     /*
         What is the directory structure of the URL?
         Illustrates a SPLIT_INDEX SQL.
@@ -548,10 +565,10 @@ pub fn q22<'a>(
 }
 
 pub fn q23<'a>(
-    auction_stream: Stream<Auction, Process<'a, Queries>, Bounded>,
-    bid_stream: Stream<Bid, Process<'a, Queries>, Bounded>,
-    person_stream: Stream<Person, Process<'a, Queries>, Bounded>
-) -> Stream<(Auction, Bid, Person), Process<'a, Queries>, Bounded, NoOrder> {
+    auction_stream: Stream<Auction, Process<'a, Queries>, Unbounded>,
+    bid_stream: Stream<Bid, Process<'a, Queries>, Unbounded>,
+    person_stream: Stream<Person, Process<'a, Queries>, Unbounded>
+) -> Stream<(Auction, Bid, Person), Process<'a, Queries>, Unbounded, NoOrder> {
     /*
         Find all bids made by a person who has also listed an item for auction
         Illustrates a multi-way join.
@@ -564,4 +581,569 @@ pub fn q23<'a>(
     let join = joined_persons_bidders.join(prepared_auctions);
     let select = join.map(q!(|(_, ((p, b), a))| (a, b, p)));
     select
+}
+
+pub fn bid(auction: i64, bidder: i64, price: i64, ts: i64, url: &str) -> Bid {
+    Bid {
+        auction,
+        bidder,
+        price,
+        channel: "test".to_string(),
+        url: url.to_string(),
+        date_time: ts,
+        extra: "abcdefgh".to_string(),
+    }
+}
+
+pub fn auction(id: i64, seller: i64, category: i64, start: i64, end: i64) -> Auction {
+    Auction {
+        id,
+        item_name: "item".to_string(),
+        description: "desc".to_string(),
+        initial_bid: 0,
+        reserve: 0,
+        date_time: start,
+        expires: end,
+        seller,
+        category,
+        extra: "".to_string(),
+    }
+}
+
+pub fn person(id: i64, state: &str, ts: i64) -> Person {
+    Person {
+        id,
+        name: format!("person{}", id),
+        email: "test@test.com".to_string(),
+        credit_card: "0000".to_string(),
+        city: "city".to_string(),
+        state: state.to_string(),
+        date_time: ts,
+        extra: "".to_string(),
+    }
+}
+
+// Tests
+#[cfg(test)]
+mod tests {
+    use hydro_lang::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn test_q1() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q1(bid_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send(bid(0, 100, 4, 0, "a"));
+            result_stream_port.assert_yields([bid(0, 100, 3, 0, "a")]).await;
+        });
+    }
+
+    #[test]
+    fn test_q2() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q2(bid_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send_many([
+                bid(100, 100, 4, 0, "a"),
+                bid(123, 100, 6, 0, "a"),
+                bid(246, 100, 7, 0, "a")
+            ]);
+            result_stream_port.assert_yields([(123, 6), (246, 7)]).await;
+        });
+    }
+
+    #[test]
+    fn test_q3() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (auctionstream_in_port, auction_stream) = process.sim_input();
+        let (personstream_in_port, person_stream) = process.sim_input();
+
+        let result_stream = q3(auction_stream, person_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            auctionstream_in_port.send_many([
+                auction(1, 15, 7, 0, 1),
+                auction(2, 9, 10, 0, 12),
+                (auction(3, 13, 10, 0, 10)),
+                auction(4, 13, 10, 0, 10)
+            ]);
+
+            personstream_in_port.send_many([
+                person(4, "PA", 100),
+                person(9, "OR", 2),
+                person(13, "CA", 5)
+            ]);
+
+            result_stream_port.assert_yields_unordered([
+                ("person9".to_string(), "city".to_string(), "OR".to_string(), 2),
+                ("person13".to_string(), "city".to_string(), "CA".to_string(), 3),
+                ("person13".to_string(), "city".to_string(), "CA".to_string(), 4),
+            ]).await;
+        });
+    }
+
+    // #[test] not yet implemented: Reduce keyed with optional intermediates is not yet supported in simulator
+    fn test_q4() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+        let tick = process.tick();
+
+        let (auctionstream_in_port, auction_stream) = process.sim_input();
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+        
+        let auction_batch = auction_stream.batch(&tick, nondet!(/** test **/));
+        let bid_batch = bid_stream.batch(&tick, nondet!(/** test **/));
+
+        let result_stream = q4(auction_batch, bid_batch);
+        let result_stream_port = result_stream.snapshot(&tick, nondet!(/** test **/)).entries().all_ticks().sim_output();
+
+        flow.sim().exhaustive(async || {
+            auctionstream_in_port.send_many([
+                auction(1, 1, 10, 0, 100),
+                auction(2, 1, 10, 0, 100),
+                auction(3, 1, 20, 0, 100),
+                auction(4, 1, 20, 50, 60)
+            ]);
+
+            bidstream_in_port.send_many([
+                bid(1, 101, 30, 10, "a"),
+                bid(1, 102, 50, 20, "a"),
+                bid(2, 103, 100, 10, "a"),
+                bid(3, 104, 5, 10, "a"),
+                bid(3, 105, 15, 20, "a"),
+                bid(4, 106, 999, 10, "a")
+            ]);
+            
+            result_stream_port.assert_yields_unordered([
+                (10, 75),
+                (20, 15)
+            ]).await;
+        });
+    }
+
+    // #[test] // broken
+    fn test_q6() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+        let tick = process.tick();
+
+        let (auctionstream_in_port, auction_stream) = process.sim_input();
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q6(auction_stream.batch(&tick, nondet!(/** test */)), bid_stream.batch(&tick, nondet!(/** test */)));
+        let result_stream_port = result_stream.all_ticks().sim_output();
+
+        flow.sim().exhaustive(async || {
+            auctionstream_in_port.send_many([
+                auction(1, 100, 10, 0, 100),
+                auction(2, 100, 10, 0, 100),
+                auction(2, 100, 10, 0, 100),
+                auction(4, 200, 20, 0, 100),
+                auction(5, 200, 20, 0, 100)
+            ]);
+            
+            bidstream_in_port.send_many([
+                bid(1, 10, 30, 10, "a"),
+                bid(1, 11, 50, 20, "a"),
+                bid(2, 12, 100, 10, "a"),
+                bid(3, 13, 60, 10, "a"),
+                bid(3, 14, 80, 20, "a"),
+                bid(4, 15, 40, 10, "a"),
+                bid(4, 16, 70, 20, "a"),
+                bid(5, 17, 20, 10, "a")
+            ]);
+
+            result_stream_port.assert_yields_unordered([
+                (100, 50),
+                (100, 75),
+                (100, 76),
+                (200, 70),
+                (200, 45)
+            ]).await;
+        });
+    }
+    
+    // #[test] not yet implemented: Reduce keyed with optional intermediates is not yet supported in simulator
+    fn test_q7() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q7(bid_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send_many([
+                bid(0, 100, 20, 0, "a"),
+                bid(0, 100, 1, 0, "a"),
+                bid(0, 100, 65, 20, "a"),
+                bid(0, 100, 30, 20, "a"),
+                bid(0, 100, 75, 50, "a"),
+                bid(0, 100, 40, 50, "a"),
+                bid(0, 100, 1, 71, "a"),
+            ]);
+
+            result_stream_port.assert_contains_unordered([
+                bid(0, 100, 20, 0, "a"),
+                bid(0, 100, 65, 20, "a"),
+                bid(0, 100, 75, 50, "a"),
+                bid(0, 100, 1, 71, "a"),
+            ]).await;
+        });
+    }
+
+    // #[test] not yet implemented: Reduce keyed with optional intermediates is not yet supported in simulator
+    fn test_q8() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (auctionstream_in_port, auction_stream) = process.sim_input();
+
+        let (personstream_in_port, person_stream) = process.sim_input();
+
+        let result_stream = q8(auction_stream, person_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            auctionstream_in_port.send_many([
+                auction(10, 1, 1, 7, 100),
+                auction(11, 2, 1, 15, 100),
+                auction(12, 2, 1, 16, 100),
+                auction(13, 3, 1, 40, 100),
+            ]);
+
+            personstream_in_port.send_many([
+                person(1, "CA", 5),
+                person(2, "OR", 12),
+                person(3, "WA", 25),
+            ]);
+
+            result_stream_port.assert_yields_unordered([
+                (1, "person1".to_string(), 0, 10),
+                (2, "person2".to_string(), 10, 20)
+            ]).await;
+        });
+    }
+
+    // #[test] // broken
+    fn test_q9() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+        let tick = process.tick();
+
+        let (auctionstream_in_port, auction_stream) = process.sim_input();
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+        let batched_auctions = auction_stream.batch(&tick, nondet!(/** test **/));
+        let batched_bids =  bid_stream.batch(&tick, nondet!(/** test **/));
+
+        let result_stream = q9(batched_auctions, batched_bids);
+        let result_stream_port = result_stream.values().all_ticks().sim_output();
+
+        flow.sim().exhaustive(async || {
+            auctionstream_in_port.send_many([
+                auction(1, 11, 10, 100, 110),
+                auction(2, 22, 20, 200, 220)
+            ]);
+
+            bidstream_in_port.send_many([
+                bid(1, 55, 20, 105, "a"),
+                bid(1, 66, 100, 107, "a"),
+                bid(2, 55, 400, 210, "a"),
+                bid(2, 66, 1, 215, "a")
+            ]);
+
+            result_stream_port.assert_yields_unordered([
+                (1, "item".to_string(), 100, 107),
+                (2, "item".to_string(), 400, 210),
+            ]).await;
+        });
+    }
+
+    // #[test] // broken
+    fn test_q11() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+        let tick = process.tick();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+        let bid_batch = bid_stream.batch(&tick, nondet!(/** test **/));
+
+        let result_stream = q11(bid_batch);
+        let result_stream_port = result_stream.all_ticks().sim_output();
+
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send_many([
+                bid(1, 1, 20, 0, "a"),
+                bid(2, 1, 20, 9, "a"),
+                bid(3, 2, 20, 10, "a"),
+                bid(4, 2, 20, 15, "a"),
+                bid(4, 2, 20, 35, "a"),
+                bid(5, 1, 20, 31, "a"),
+                bid(6, 3, 20, 35, "a"),
+            ]);
+
+            result_stream_port.assert_yields_unordered([
+                (1, 2, 0, 9),
+                (2, 2, 10, 15),
+            ]).await;
+        });
+
+    }
+
+    #[test]
+    fn test_q14() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q14(bid_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send_many([
+                bid(1, 11, 3000000, 9, "0/1/2/3/4/5"),
+                bid(2, 22, 60000000, 24, "0/1/2/3/4/5"),
+                bid(3, 33, 4000000, 21, "a/b/c/d/e/f"),
+            ]);
+
+            result_stream_port.assert_yields([
+                (1, 11, 2724000.0, "dayTime".to_string(), 9,  "abcdefgh".to_string(), 1),
+                (3, 33, 3632000.0, "nightTime".to_string(), 21,  "abcdefgh".to_string(), 1)
+            ]).await;
+        });
+    }
+
+    #[test]
+    fn test_q17() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+        let tick = process.tick();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q17(bid_stream);
+        let result_stream_port = result_stream.snapshot(&tick, nondet!(/** Test **/)).values().all_ticks().sim_output();
+
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send_many([
+                bid(1, 1, 10000, 50, "a"),
+                bid(1, 2, 5000, 50, "a"),
+                bid(1, 3, 3000000, 50, "a"),
+            ]);
+
+            result_stream_port.assert_contains_unordered([
+                (1, 50, 3, 1, 1, 1, 5000, 3000000, 1005000, 3015000)
+            ]).await;
+        });
+    }
+
+    // #[test] // not yet implemented: Reduce keyed with optional intermediates is not yet supported in simulator
+    fn test_q18() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+        let tick = process.tick();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q18(bid_stream);
+        let result_stream_port = result_stream.snapshot(&tick, nondet!(/** test **/)).values().all_ticks().sim_output();
+
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send_many([
+                bid(1, 1, 20, 0, "a"),
+                bid(1, 1, 50, 100, "a"),
+                bid(2, 1, 20, 200, "a"),
+                bid(3, 5, 20, 300, "a"),
+                bid(3, 5, 26, 400, "a"),
+            ]);
+
+            result_stream_port.assert_contains_unordered([
+                (1, 1, 100, 50, 1),
+                (1, 2, 200, 20, 0),
+                (5, 6, 400, 26, 0)
+            ]).await;
+        });
+    }
+
+    // #[test] // broken
+    fn test_q19() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+        let tick = process.tick();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+        let batched_bids = bid_stream.batch(&tick, nondet!(/** test **/));
+
+        let result_stream = q19(batched_bids);
+        let result_stream_port = result_stream.all_ticks().sim_output();
+        
+        flow.sim().exhaustive(async || {
+            bidstream_in_port.send_many([
+                bid(1, 11, 1000, 1, "0/1/2/3/4/5"),
+                bid(1, 22, 2000, 2, "0/1/2/3/4/5"),
+                bid(1, 33, 3000, 3, "a/b/c/d/e/f"),
+                bid(1, 33, 4000, 4, "a/b/c/d/e/f"),
+                bid(1, 33, 5000, 5, "a/b/c/d/e/f"),
+                bid(1, 33, 6000, 21, "a/b/c/d/e/f"),
+                bid(1, 33, 7000, 21, "a/b/c/d/e/f"),
+                bid(1, 33, 8000, 21, "a/b/c/d/e/f"),
+                bid(1, 33, 9000, 21, "a/b/c/d/e/f"),
+                bid(1, 33, 10000, 21, "a/b/c/d/e/f"),
+                bid(1, 33, 10500, 21, "a/b/c/d/e/f"),
+                bid(2, 11, 11000, 9, "0/1/2/3/4/5"),
+                bid(2, 22, 12000, 24, "0/1/2/3/4/5"),
+                bid(2, 33, 13000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 14000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 15000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 16000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 17000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 18000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 19000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 20000, 21, "a/b/c/d/e/f"),
+                bid(2, 33, 21000, 21, "a/b/c/d/e/f"),
+            ]);
+
+            result_stream_port.assert_yields_only_unordered([
+                (1, 1, 10500),
+                (2, 1, 10000),
+                (3, 1, 9000),
+                (4, 1, 8000),
+                (5, 1, 7000),
+                (6, 1, 6000),
+                (7, 1, 5000),
+                (8, 1, 4000),
+                (9, 1, 3000),
+                (10, 1, 2000),
+                (1, 2, 21000),
+                (2, 2, 20000),
+                (3, 2, 19000),
+                (4, 2, 18000),
+                (5, 2, 17000),
+                (6, 2, 16000),
+                (7, 2, 15000),
+                (8, 2, 14000),
+                (9, 2, 13000),
+                (10, 2, 12000),
+            ]).await;
+        });
+    }
+
+    #[test]
+    fn test_q20() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (auctionstream_in_port, auction_stream) = process.sim_input();
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q20(bid_stream, auction_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            auctionstream_in_port.send_many([
+                auction(1, 20, 10, 0, 200),
+                auction(2, 21, 11, 100, 200),
+            ]);
+
+            bidstream_in_port.send_many([
+                bid(1, 11, 150, 35, "0/1/2/3/4/5"),
+                bid(2, 12, 100, 35, "0/1/2/3/4/5"),
+                bid(1, 23, 200, 45, "a/b/c/d/e/f"),
+            ]);
+
+            result_stream_port.assert_yields_unordered([
+                (1, 35, "item".to_string(), 0, 20, 10),
+                (1, 45, "item".to_string(), 0, 20, 10)
+            ]).await;
+        });
+    }
+
+    #[test]
+    fn test_q22() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+
+        let result_stream = q22(bid_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+
+            bidstream_in_port.send_many([
+                bid(11, 1, 100, 35, "0/1/2/3/4/5"),
+                bid(12, 2, 200, 45, "a/b/c/d/e/f"),
+                bid(13, 3, 300, 55, "z/y/x/v/u/r"),
+            ]);
+
+            result_stream_port.assert_yields([
+                (11, 1, 100, "test".to_string(), "3".to_string(), "4".to_string(), "5".to_string()),
+                (12, 2, 200, "test".to_string(), "d".to_string(), "e".to_string(), "f".to_string()),
+                (13, 3, 300, "test".to_string(), "v".to_string(), "u".to_string(), "r".to_string()),
+            ]).await;
+        });
+    }
+
+    #[test]
+    fn test_q23() {
+        let mut flow = FlowBuilder::new();
+        let process: Process<'_, Queries> = flow.process();
+
+        let (auctionstream_in_port, auction_stream) = process.sim_input();
+        let (bidstream_in_port, bid_stream) = process.sim_input();
+        let (personstream_in_port, person_stream) = process.sim_input();
+
+        let result_stream = q23(auction_stream, bid_stream, person_stream);
+        let result_stream_port = result_stream.sim_output();
+
+        flow.sim().exhaustive(async || {
+            auctionstream_in_port.send_many([
+                auction(1, 1, 10, 0, 10),
+                auction(2, 2, 11, 10, 20),
+                auction(3, 1, 12, 20, 30),
+                auction(4, 4, 13, 30, 40),
+                auction(5, 3, 14, 40, 50)
+            ]);
+
+            bidstream_in_port.send_many([
+                bid(11, 1, 100, 35, "a"),
+                bid(12, 2, 200, 45, "a"),
+                bid(13, 3, 300, 55, "a"),
+                bid(14, 2, 400, 60, "a")
+            ]);
+
+            personstream_in_port.send_many([
+                person(1, "CA", 1),
+                person(2, "OR", 2),
+                person(3, "PA", 3),
+            ]);
+            result_stream_port.assert_yields_unordered([
+                (auction(1, 1, 10, 0, 10), bid(11, 1, 100, 35, "a"), person(1, "CA", 1)),
+                (auction(3, 1, 12, 20, 30), bid(11, 1, 100, 35, "a"), person(1, "CA", 1)),
+                (auction(2, 2, 11, 10, 20), bid(12, 2, 200, 45, "a"), person(2, "OR", 2)),
+                (auction(2, 2, 11, 10, 20), bid(14, 2, 400, 60, "a"), person(2, "OR", 2)),
+                (auction(5, 3, 14, 40, 50), bid(13, 3, 300, 55, "a"), person(3, "PA", 3))
+            ]).await;
+        });
+    }
+
 }
